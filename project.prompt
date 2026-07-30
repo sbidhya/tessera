@@ -1,0 +1,104 @@
+# Project: Tessera — a game backend + mobile Sequence game
+
+  You are helping me build a small but real multiplayer game backend, and a mobile
+  client for the board game **Sequence** to exercise it. I am doing this to learn
+  backend/game-server systems concepts (authoritative state, rooms, WebSockets,
+  write-ahead logging, persistence tiers, matchmaking, reconnection). Treat this as
+  a learning project: explain the *why* behind design choices, not just the code.
+
+  ## Tech stack (already decided — do not re-litigate)
+  - Backend: **Go** (standard library first; add deps only when justified).
+  - Mobile client: **Flutter (Dart)**, iOS + Android.
+  - Persistence: start minimal — in-memory state + a write-ahead log file + SQLite.
+    Redis/Postgres/horizontal scaling come later as optional blocks.
+
+  ## How we work together (STRICT — this matters most)
+  1. Build **one building block at a time**, in the order below.
+  2. For each block: (a) briefly restate what it does, (b) implement it, (c) write
+     tests, (d) show me how to run the tests and what "green" looks like.
+     **Do not start the next block until I confirm the current one passes.**
+  3. Enforce strict inward-pointing layers:
+     engine (pure logic) ← room manager ← transport ← persistence ← infra.
+     The engine must NOT import networking or DB packages.
+  4. Use **seeded RNG** everywhere randomness appears (shuffles), so tests are
+     deterministic and reproducible.
+  5. Run concurrency-sensitive code under `go test -race`.
+  6. Prefer clarity over cleverness; comment the non-obvious systems decisions.
+  7. If a decision is genuinely mine to make, ask a focused question instead of
+     guessing. Otherwise pick a sensible default and note it.
+
+  ## The game (get the model right)
+  Sequence: a 10×10 board (100 cells). Every non-jack card appears on the board
+  twice; the 4 corners are wild ("free") spaces belonging to everyone. On your turn:
+  play a card from hand → place a chip on a matching OPEN cell → draw a replacement.
+  - **Two-eyed jacks** (J♦, J♣) = wild: place a chip on any open cell.
+  - **One-eyed jacks** (J♥, J♠) = remove one opponent chip (not one already part of
+    a completed sequence).
+  - **Dead card**: if both board cells for a card you hold are occupied, you may
+    discard it and draw, once per turn.
+  - **Win**: form a run of **5 chips in a row** horizontally, vertically, or
+    diagonally; corners count as wild for any player.
+  - v1 scope: **2 players**, `sequences_to_win` configurable (default 2; allow 1 for
+    fast test games).
+
+  ## Building blocks — backend
+  - **B0 Skeleton & tooling**: Go module, repo layout, Makefile, `/healthz` HTTP
+    endpoint, structured logging, config with seeded RNG.
+    Gate: `curl /healthz` = 200; `go test ./...` runs clean.
+  - **B1 Pure game engine (no I/O)**: Card, Deck, Board (cell↔card map + corners),
+    Player, Chip, GameState; rules for deal, play-card→place-chip, both jack types,
+    dead-card swap, draw, sequence detection, win. All pure functions.
+    Gate: extensive table-driven tests — sequence detection in every direction incl.
+    corners, both jack behaviors, illegal/out-of-turn moves, win conditions.
+    (This is the crown jewel — over-test it before anything else touches it.)
+  - **B2 In-memory room manager**: each room = one match's GameState owned by a
+    single goroutine fed by a command channel (actor model, no shared-memory locks
+    on the hot path). Commands: Join, PlayMove, Leave. Idempotency: each move carries
+    move_id + expected turn/seq; reject duplicates and out-of-turn moves.
+    Gate: drive a full 2-player game in-process; pass `go test -race` under load.
+  - **B3 Transport (HTTP + WebSocket)**: REST (create/list matches, GET state for
+    reconnect) + WebSocket (per-connection goroutine; client sends move requests,
+    server is authoritative and broadcasts results). Typed JSON envelope
+    {type, seq, payload}.
+    Gate: integration test — two WS clients play a full game through the server;
+    drop a socket mid-game, reconnect via GET state, resume.
+  - **B4 Durability — WAL + replay**: append-only per-match event log; every accepted
+    command is appended (configurable fsync policy) BEFORE apply/ack. On startup,
+    replay the WAL to rebuild state; apply idempotently via move_id/seq.
+    Gate: kill the process mid-game, restart, assert full recovery; assert duplicate
+    replay is safe.
+  - **B5 Cold tier — SQLite + write-behind**: persist finished matches, history, and
+    player stats to SQLite asynchronously in batches; checkpoint/truncate the WAL
+    after a successful flush.
+    Gate: history+stats land in SQLite; WAL checkpoints; a crash between WAL and
+    SQLite still recovers.
+  - **B6 Matchmaking, presence, light auth**: anonymous player id + lightweight
+    token; in-memory matchmaking queue (join → paired into a room); basic presence.
+    Gate: two clients matchmake, get paired, play; identity survives reconnect.
+
+  ## Building blocks — mobile (Flutter)
+  - **M1** app skeleton → hit `/healthz`, show server status.
+  - **M2** identity + lobby (create/join/matchmake via REST).
+  - **M3** board rendering — 10×10 grid, card faces, chips (render a static GET
+    state first).
+  - **M4** WebSocket wiring — live state in, tap-card→tap-cell moves out.
+  - **M5** full game UI — hand, turn indicator, both jack flows, dead-card, win
+    screen.
+  - **M6** reconnection UX.
+    Gate per step: manual play on emulator against the tested backend; finish by
+    running two emulators playing each other.
+
+  ## Later / optional (do not start unless I ask)
+  Redis for shared matchmaking/presence/pub-sub + leaderboard; multi-process
+  horizontal scaling with sharded rooms; JSON→protobuf; Prometheus metrics; Postgres.
+
+  ## Proposed repo layout
+  tessera/
+    backend/  cmd/tessera/ , internal/{engine,room,transport,wal,store,match}
+    mobile/   (Flutter app)
+    docs/     (message protocol + design notes)
+
+  ## Start here
+  First show me a short plan for **B0 + B1** and wait for my "go". Then implement B0,
+  show the test gate, and stop for my confirmation before B1. Do not scaffold future
+  blocks ahead of time.
