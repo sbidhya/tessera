@@ -1,0 +1,27 @@
+# Binaries
+/backend/bin/
+/bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Go
+*.test
+*.out
+
+# WAL / SQLite (future blocks B4/B5)
+*.wal
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Env
+.env
