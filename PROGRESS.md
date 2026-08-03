@@ -21,7 +21,7 @@ This file tracks completed building blocks so the next task can resume from the 
   ```
 - **Files**: `backend/go.mod`, `backend/cmd/tessera/main.go`, `backend/internal/config/*`, `backend/internal/logger/*`, `backend/internal/transport/*`, `backend/Makefile`, `Makefile`
 - **Completed**: 2026-08-03
-- **PR**: #TBD
+- **PR**: https://github.com/sbidhya/tessera/pull/1 (feat/b0-skeleton → main)
 
 ## Next up
 
