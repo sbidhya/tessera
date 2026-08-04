@@ -37,9 +37,10 @@ func run() error {
 
 	logger := cfg.Logger()
 
-	// Confirm the seeded RNG is wired; a later block will hand this to the deck
-	// shuffler. Logging one draw at debug level makes the seed visible in dev.
-	rng := cfg.NewRand()
+	// Confirm the seeded RNG is wired; a later block will derive per-room and
+	// per-deck streams by name. Logging one draw from a probe stream at debug
+	// level makes the seed visible in dev without perturbing any real stream.
+	rng := cfg.NewRand("startup-probe")
 	logger.Debug("rng initialised", "seed", cfg.Seed, "sample", rng.Uint64())
 
 	start := time.Now()

@@ -67,28 +67,93 @@ func TestLoadInvalidLogLevel(t *testing.T) {
 	}
 }
 
-// TestNewRandDeterministic is the load-bearing test for the whole project's
-// reproducibility guarantee: the same seed must produce the same stream.
-func TestNewRandDeterministic(t *testing.T) {
+// drawN pulls n consecutive uint64s from r into a slice for easy comparison.
+func drawN(r interface{ Uint64() uint64 }, n int) []uint64 {
+	out := make([]uint64, n)
+	for i := range out {
+		out[i] = r.Uint64()
+	}
+	return out
+}
+
+// TestNewRandSameStreamDeterministic proves the within-run half of the
+// reproducibility guarantee: the same (Seed, name) yields the same sequence,
+// so a given consumer always draws identically.
+func TestNewRandSameStreamDeterministic(t *testing.T) {
 	cfg := Config{Seed: 12345}
 
-	r1 := cfg.NewRand()
-	r2 := cfg.NewRand()
+	r1 := cfg.NewRand("deck")
+	r2 := cfg.NewRand("deck")
 
 	for i := 0; i < 100; i++ {
 		a, b := r1.Uint64(), r2.Uint64()
 		if a != b {
-			t.Fatalf("draw %d: %d != %d — same seed must yield same stream", i, a, b)
+			t.Fatalf("draw %d: %d != %d — same (seed,name) must yield same stream", i, a, b)
 		}
 	}
 }
 
+// TestNewRandStreamsDiverge proves the independence property: two named streams
+// from the *same* Config must diverge from each other. This is the bug the
+// per-stream derivation fixes — previously every stream aliased onto one shared
+// sequence, so two subsystems drawing at once got identical "random" values.
+func TestNewRandStreamsDiverge(t *testing.T) {
+	cfg := Config{Seed: 12345}
+
+	// Compare several distinct names pairwise; none may share a sequence.
+	names := []string{"deck", "room-1", "room-2", "matchmaking"}
+	streams := make([][]uint64, len(names))
+	for i, n := range names {
+		streams[i] = drawN(cfg.NewRand(n), 8)
+	}
+
+	equal := func(a, b []uint64) bool {
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if equal(streams[i], streams[j]) {
+				t.Fatalf("streams %q and %q produced identical sequences — streams are not independent",
+					names[i], names[j])
+			}
+		}
+	}
+}
+
+// TestNewRandReproducibleAcrossRuns proves the cross-run property with golden
+// values: for a fixed (Seed, name) the first draws are byte-identical on every
+// run of the binary. If this test ever fails, the RNG derivation changed and
+// every previously-recorded game replay is invalidated — treat it as a
+// deliberate, breaking decision, not an incidental edit.
+func TestNewRandReproducibleAcrossRuns(t *testing.T) {
+	cfg := Config{Seed: 12345}
+
+	got := drawN(cfg.NewRand("deck"), 4)
+	want := []uint64{
+		0x5f2b44d19c0bf12e, 0x845ea453f3d76917,
+		0xb1d8bea93f48aea4, 0x55da41b36d863ee7,
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("draw %d = %#016x, want %#016x — RNG stream drifted across runs", i, got[i], want[i])
+		}
+	}
+}
+
+// TestNewRandDiffersBySeed confirms the Seed still selects the whole family of
+// streams: the same name under two different seeds diverges.
 func TestNewRandDiffersBySeed(t *testing.T) {
-	a := Config{Seed: 1}.NewRand()
-	b := Config{Seed: 2}.NewRand()
+	a := Config{Seed: 1}.NewRand("deck")
+	b := Config{Seed: 2}.NewRand("deck")
 
 	// Extremely unlikely that two different seeds match on the first draw.
 	if a.Uint64() == b.Uint64() {
-		t.Fatal("different seeds produced identical first draw")
+		t.Fatal("different seeds produced identical first draw for the same stream")
 	}
 }

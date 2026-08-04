@@ -8,10 +8,18 @@
 // in the game (notably deck shuffles) must be derived from Config.NewRand so
 // that a given Seed produces an identical game. That makes tests deterministic
 // and makes bugs reproducible from a single integer.
+//
+// NewRand takes a stream name so that independent subsystems — each room, the
+// deck, matchmaking, ... — get statistically independent generators that never
+// alias onto one another, while the whole process stays reproducible from the
+// single Seed. See NewRand for the derivation.
 package config
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -79,18 +87,43 @@ func LoadFromEnv() (Config, error) {
 	return Load(os.Getenv)
 }
 
-// NewRand returns a fresh, deterministic random source derived from Seed.
+// NewRand returns a fresh, deterministic random source for the named stream.
 //
-// Each call returns an independent generator positioned at the same starting
-// point, so callers that each want the "same" stream get it. Because it is
-// seeded from a plain int64, an entire game's shuffle is reproducible from that
-// one number.
-func (c Config) NewRand() *rand.Rand {
-	// PCG takes two 64-bit words. We derive the second word from the seed with
-	// a fixed transform so a single int64 fully determines the stream while
-	// still exercising both PCG inputs.
-	s := uint64(c.Seed)
-	return rand.New(rand.NewPCG(s, s^0x9e3779b97f4a7c15))
+// Streams are keyed by name: NewRand("room-7") and NewRand("deck") return
+// independent generators, so two subsystems drawing concurrently never receive
+// the same sequence — the correctness hazard that a single shared stream would
+// create. Yet everything is derived from the single Seed, so:
+//
+//   - the same (Seed, name) yields a byte-identical sequence on every run, and
+//   - the mapping is order-independent: which subsystem calls first does not
+//     change any stream, so a whole game is reproducible from one integer.
+//
+// Derivation: hash (Seed, name) into one 64-bit value, then expand it into
+// PCG's two state words with two splitmix64 steps. splitmix64 has good
+// avalanche, so even near-identical names ("room-1" vs "room-2") map to
+// well-separated, statistically independent PCG states.
+func (c Config) NewRand(stream string) *rand.Rand {
+	h := fnv.New64a()
+	var seed [8]byte
+	binary.LittleEndian.PutUint64(seed[:], uint64(c.Seed))
+	_, _ = h.Write(seed[:])
+	_, _ = io.WriteString(h, stream)
+	mixed := h.Sum64()
+
+	return rand.New(rand.NewPCG(
+		splitmix64(mixed),
+		splitmix64(mixed+0x9e3779b97f4a7c15),
+	))
+}
+
+// splitmix64 is the SplitMix64 finalizer. It maps each 64-bit input to a
+// well-distributed 64-bit output, giving each named stream a state that is
+// decorrelated from its neighbours.
+func splitmix64(x uint64) uint64 {
+	x += 0x9e3779b97f4a7c15
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	return x ^ (x >> 31)
 }
 
 // Logger builds a JSON structured logger at the configured level, writing to
