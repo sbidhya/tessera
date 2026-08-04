@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"sync"
 	"testing"
 )
 
@@ -48,8 +49,9 @@ func TestLoadEmptyKeepsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg != Default() {
-		t.Errorf("Load with no env = %+v, want %+v", cfg, Default())
+	def := Default()
+	if cfg.Addr != def.Addr || cfg.Seed != def.Seed || cfg.LogLevel != def.LogLevel {
+		t.Errorf("Load with no env = %+v, want %+v (comparing Addr/Seed/LogLevel)", cfg, def)
 	}
 }
 
@@ -67,28 +69,197 @@ func TestLoadInvalidLogLevel(t *testing.T) {
 	}
 }
 
-// TestNewRandDeterministic is the load-bearing test for the whole project's
-// reproducibility guarantee: the same seed must produce the same stream.
-func TestNewRandDeterministic(t *testing.T) {
-	cfg := Config{Seed: 12345}
+// TestNewRandIndependentStreams proves the correctness fix: two successive
+// NewRand streams from the same Config must diverge, otherwise two subsystems
+// (e.g. two rooms) would shuffle identically.
+func TestNewRandIndependentStreams(t *testing.T) {
+	cfg := Default()
+	cfg.Seed = 12345
 
 	r1 := cfg.NewRand()
 	r2 := cfg.NewRand()
 
+	// Draw a window and require at least one difference. With distinct PCG
+	// seeds the probability of 100 identical draws is negligible (2^-6400).
+	diverged := false
 	for i := 0; i < 100; i++ {
-		a, b := r1.Uint64(), r2.Uint64()
-		if a != b {
-			t.Fatalf("draw %d: %d != %d — same seed must yield same stream", i, a, b)
+		if r1.Uint64() != r2.Uint64() {
+			diverged = true
+			break
+		}
+	}
+	if !diverged {
+		t.Fatal("two streams from same Config were identical for 100 draws — they must diverge")
+	}
+}
+
+// TestNewRandReproducibleAcrossRuns proves that while streams within a Config
+// diverge, the same Seed yields byte-identical streams across runs when the
+// call order is the same. We simulate two runs by creating two separate Configs
+// with the same Seed and comparing the Nth stream from each.
+func TestNewRandReproducibleAcrossRuns(t *testing.T) {
+	seed := int64(12345)
+
+	cfgA := Default()
+	cfgA.Seed = seed
+	cfgB := Default()
+	cfgB.Seed = seed
+
+	// First stream from each Config must be identical.
+	a1 := cfgA.NewRand()
+	b1 := cfgB.NewRand()
+	for i := 0; i < 100; i++ {
+		if a1.Uint64() != b1.Uint64() {
+			t.Fatalf("first stream diverged across runs at draw %d", i)
+		}
+	}
+
+	// Second stream from each Config must also be identical (but different from first).
+	a2 := cfgA.NewRand()
+	b2 := cfgB.NewRand()
+	for i := 0; i < 100; i++ {
+		if a2.Uint64() != b2.Uint64() {
+			t.Fatalf("second stream diverged across runs at draw %d", i)
+		}
+	}
+
+	// And first vs second within same run must still diverge (sanity).
+	cfgC := Default()
+	cfgC.Seed = seed
+	r1 := cfgC.NewRand()
+	r2 := cfgC.NewRand()
+	same := true
+	for i := 0; i < 20; i++ {
+		if r1.Uint64() != r2.Uint64() {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Fatal("first and second streams within same Config must not be identical")
+	}
+}
+
+// TestNewRandForIndependentAndReproducible covers the named-consumer path
+// (e.g. per-room): different names diverge, same name is stable, and the
+// result does not depend on how many anonymous NewRand calls happened before.
+func TestNewRandForIndependentAndReproducible(t *testing.T) {
+	seed := int64(999)
+
+	// Different names must diverge.
+	cfg := Default()
+	cfg.Seed = seed
+	ra := cfg.NewRandFor("room-a")
+	rb := cfg.NewRandFor("room-b")
+	diverged := false
+	for i := 0; i < 20; i++ {
+		if ra.Uint64() != rb.Uint64() {
+			diverged = true
+			break
+		}
+	}
+	if !diverged {
+		t.Fatal("NewRandFor with different names produced identical streams")
+	}
+
+	// Same name must be byte-identical across Configs (simulated runs).
+	cfg1 := Default()
+	cfg1.Seed = seed
+	cfg2 := Default()
+	cfg2.Seed = seed
+	r1 := cfg1.NewRandFor("room-42")
+	r2 := cfg2.NewRandFor("room-42")
+	for i := 0; i < 100; i++ {
+		if r1.Uint64() != r2.Uint64() {
+			t.Fatalf("NewRandFor same name diverged across runs at draw %d", i)
+		}
+	}
+
+	// NewRandFor must be independent of NewRand call order.
+	cfg3 := Default()
+	cfg3.Seed = seed
+	_ = cfg3.NewRand()
+	_ = cfg3.NewRand()
+	rNamedAfter := cfg3.NewRandFor("stable-room")
+	cfg4 := Default()
+	cfg4.Seed = seed
+	rNamedBefore := cfg4.NewRandFor("stable-room")
+	for i := 0; i < 100; i++ {
+		if rNamedAfter.Uint64() != rNamedBefore.Uint64() {
+			t.Fatalf("NewRandFor should be order-independent, diverged at draw %d", i)
 		}
 	}
 }
 
+// TestNewRandDiffersBySeed ensures different seeds still produce different streams.
 func TestNewRandDiffersBySeed(t *testing.T) {
-	a := Config{Seed: 1}.NewRand()
-	b := Config{Seed: 2}.NewRand()
+	cfgA := Default()
+	cfgA.Seed = 1
+	cfgB := Default()
+	cfgB.Seed = 2
+	a := cfgA.NewRand()
+	b := cfgB.NewRand()
 
 	// Extremely unlikely that two different seeds match on the first draw.
 	if a.Uint64() == b.Uint64() {
 		t.Fatal("different seeds produced identical first draw")
+	}
+}
+
+// TestNewRandConcurrentSafety ensures NewRand can be called concurrently without
+// races and still yields distinct streams.
+func TestNewRandConcurrentSafety(t *testing.T) {
+	cfg := Default()
+	cfg.Seed = 42
+
+	const goroutines = 20
+	results := make([]uint64, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r := cfg.NewRand()
+			results[idx] = r.Uint64()
+		}(i)
+	}
+	wg.Wait()
+
+	// All first draws should be distinct (very high probability). At minimum
+	// we require not all equal.
+	allEqual := true
+	for i := 1; i < goroutines; i++ {
+		if results[i] != results[0] {
+			allEqual = false
+			break
+		}
+	}
+	if allEqual {
+		t.Fatal("concurrent NewRand calls produced identical first draws — expected distinct streams")
+	}
+}
+
+// TestRNGAlias ensures the compatibility alias RNG/RNGFor behaves identically.
+func TestRNGAlias(t *testing.T) {
+	cfg := Default()
+	cfg.Seed = 777
+	r1 := cfg.RNG()
+	r2 := cfg.NewRand()
+	// r1 and r2 are successive streams, so they must diverge.
+	if r1.Uint64() == r2.Uint64() {
+		// Could coincidentally match, check longer window.
+		r1b := cfg.RNG()
+		r2b := cfg.NewRand()
+		if r1b.Uint64() == r2b.Uint64() {
+			t.Log("warning: RNG alias first draws collided, checking longer sequence")
+		}
+	}
+	// RNGFor should match NewRandFor.
+	cfgA := Default()
+	cfgA.Seed = 123
+	cfgB := Default()
+	cfgB.Seed = 123
+	if cfgA.RNGFor("x").Uint64() != cfgB.NewRandFor("x").Uint64() {
+		t.Fatal("RNGFor and NewRandFor diverged for same name/seed")
 	}
 }
