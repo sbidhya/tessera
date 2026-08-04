@@ -1,0 +1,24 @@
+# Go
+/backend/bin/
+*.out
+*.test
+
+# Runtime data (WAL files, SQLite dbs — appear in later blocks)
+*.wal
+*.db
+*.db-journal
+/backend/data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Flutter (mobile client — later blocks)
+mobile/.dart_tool/
+mobile/build/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+
+# Scratch
+scratch.prompt
