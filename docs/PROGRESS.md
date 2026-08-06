@@ -13,8 +13,25 @@ current one is confirmed passing.
   - `internal/config`: env-overridable config + **seeded RNG** (`Config.NewRand`,
     deterministic from a single int64 seed).
   - Gate: `curl /healthz` = 200 ✅; `go test ./...` clean ✅; `go test -race` clean ✅.
-- [ ] **B1 — Pure game engine (no I/O)** ← next
-- [ ] **B2 — In-memory room manager**
+- [x] **B1 — Pure game engine (no I/O)** _(PR: b1-game-engine)_
+  - `internal/engine`, standard-library only — the innermost layer imports no
+    networking/DB (enforces the inward-pointing layering).
+  - Model: `Card`/`Rank`/`Suit` + jack classification (two-eyed J♦/J♣ wild,
+    one-eyed J♥/J♠ remove); 104-card double deck; seeded `Shuffle`.
+  - `Board`: 10×10, four wild corners, cell↔card index. Layout is **generated
+    deterministically from the injected RNG** (correct-by-construction: every
+    non-jack card appears exactly twice) — a fixed canonical layout can be
+    swapped into `NewBoard` later with zero rule changes. See `docs/engine.md`.
+  - `GameState` + `Apply(Move)`: deal, place (normal + two-eyed jack),
+    one-eyed-jack remove, dead-card swap (once/turn, keeps turn), draw,
+    sequence detection (all 4 directions incl. corners, "reuse ≤1 cell" overlap
+    rule), win at `SequencesToWin`. Validation is transactional: a rejected move
+    leaves state unchanged.
+  - Determinism: given the same injected `*rand.Rand` + moves, byte-identical
+    state every run (needed for B4 WAL replay).
+  - Gate: `go test ./...` clean ✅ (54 engine cases, 97.5% coverage);
+    `go test -race ./...` clean ✅; `go vet` + `gofmt` clean ✅.
+- [ ] **B2 — In-memory room manager** ← next
 - [ ] **B3 — Transport (HTTP + WebSocket)**
 - [ ] **B4 — Durability: WAL + replay**
 - [ ] **B5 — Cold tier: SQLite + write-behind**
