@@ -31,8 +31,28 @@ current one is confirmed passing.
     state every run (needed for B4 WAL replay).
   - Gate: `go test ./...` clean ✅ (54 engine cases, 97.5% coverage);
     `go test -race ./...` clean ✅; `go vet` + `gofmt` clean ✅.
-- [ ] **B2 — In-memory room manager** ← next
-- [ ] **B3 — Transport (HTTP + WebSocket)**
+- [x] **B2 — In-memory room manager** _(PR: b2-room-manager)_
+  - `internal/room`, importing only `engine` + `config` (layering verified with
+    `go list -deps`).
+  - **Actor model**: each room owns one `engine.GameState` touched by exactly one
+    goroutine fed by a command channel — no mutex on the hot path. Reply channels
+    are buffered so a dead client can never wedge a match. The registry
+    (`Manager`) uses a mutex, but only on the cold create/lookup/reap path and
+    never while sending a command.
+  - Commands: `Join`, `PlayMove`, `Leave`, plus `Snapshot` (state may only leave
+    the room as a **deep copy**; the draw pile leaves as a count only).
+  - **Idempotency**: mandatory per-player-scoped `MoveID` — duplicates replay the
+    original ack *before* any other validation, and only accepted moves are
+    recorded. Optional `ExpectedSeq` optimistic check (`ErrStaleSeq`); out-of-turn
+    rejection comes free from the engine. Presence changes deliberately do not
+    bump `Seq`.
+  - Seats: join is idempotent (rejoin = reconnect to the same seat/hand); leaving
+    before the start frees the seat, leaving mid-game holds it for reconnect.
+  - Gate: full 2-player games driven in-process via the public API ✅;
+    `go test -race ./...` clean, incl. a retry storm (8 concurrent identical
+    submissions per move) with 4 concurrent snapshot readers, and 12 parallel
+    matches ✅; 97.2% coverage; `go vet` + `gofmt` clean ✅. See `docs/room.md`.
+- [ ] **B3 — Transport (HTTP + WebSocket)** ← next
 - [ ] **B4 — Durability: WAL + replay**
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
