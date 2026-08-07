@@ -31,8 +31,31 @@ current one is confirmed passing.
     state every run (needed for B4 WAL replay).
   - Gate: `go test ./...` clean ✅ (54 engine cases, 97.5% coverage);
     `go test -race ./...` clean ✅; `go vet` + `gofmt` clean ✅.
-- [ ] **B2 — In-memory room manager** ← next
-- [ ] **B3 — Transport (HTTP + WebSocket)**
+- [x] **B2 — In-memory room manager** _(PR: b2-room-manager)_
+  - `internal/room`, importing `engine` + stdlib only (layering verified with
+    `go list -deps`). Not yet wired into `cmd/tessera` — that lands with B3.
+  - **Actor model**: one goroutine owns each match's `GameState`, fed by a
+    buffered command mailbox (`Join`, `PlayMove`, `Leave`, `Snapshot`). No locks
+    on the hot path; the mailbox order is the match's event order, which is what
+    B3 broadcasts and B4 logs. `Manager` uses a mutex only for the room
+    directory (once per match, not per move).
+  - **Idempotency**: every move carries `move_id` + optional `ExpectedSeq`.
+    Accepted moves are cached per `(player, move_id)`; a retry replays the
+    original ack (`Duplicate: true`) instead of re-applying. The duplicate check
+    runs *before* staleness/rules checks so a late retry can't be turned into a
+    spurious error. Rejected moves don't consume their id.
+  - **Authority & privacy**: the acting seat comes from the room's seating
+    table, never the request; `Snapshot` is per-viewer (own hand only, deep
+    copied) so no future endpoint can leak an opponent's cards.
+  - **Reconnect**: `Join` is idempotent; mid-match `Leave` holds the seat.
+  - Determinism: per-room RNG streams from one process seed (ids + deals
+    reproducible, no two rooms share a shuffle). See `docs/room.md`.
+  - Gate: full 2-player match driven in-process over 6 seeds ✅; concurrent-load
+    test (32 simultaneous duplicate submits apply exactly once; both players
+    hammering + snapshot readers + leave/join churn) ✅; `go test ./...` clean ✅;
+    `go test -race ./...` clean over 5 runs ✅ (98.8% coverage); `go vet` +
+    `gofmt` clean ✅.
+- [ ] **B3 — Transport (HTTP + WebSocket)** ← next
 - [ ] **B4 — Durability: WAL + replay**
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
