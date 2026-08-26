@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/config"
+	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
 func main() {
@@ -44,9 +45,11 @@ func run() error {
 	logger.Debug("rng initialised", "seed", cfg.Seed, "sample", rng.Uint64())
 
 	start := time.Now()
+	mgr := room.NewManager(logger, cfg.NewRand)
+	defer mgr.Shutdown()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newRouter(logger, start, time.Now),
+		Handler:           newHandler(mgr, logger, start, time.Now),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

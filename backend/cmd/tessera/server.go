@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
+
+	"github.com/sbidhya/tessera/backend/internal/room"
+	"github.com/sbidhya/tessera/backend/internal/transport"
 )
 
 // buildInfo is reported by /healthz. It is intentionally tiny for B0; later
@@ -14,11 +20,11 @@ type healthResponse struct {
 	Uptime string `json:"uptime"`
 }
 
-// newRouter constructs the HTTP handler for the backend.
+// newRouter constructs the HTTP handler for the backend in the B0 era.
 //
-// It lives in its own function (rather than being inlined in main) so tests can
-// exercise the exact routing/handlers the server uses without binding a socket.
-// start marks process boot so /healthz can report uptime.
+// It is retained so existing TestHealthz* tests keep exercising GET /healthz
+// without a room manager. New code should use newHandler, which exposes the
+// full REST + WebSocket surface via transport.Server.
 func newRouter(logger *slog.Logger, start time.Time, now func() time.Time) http.Handler {
 	mux := http.NewServeMux()
 
@@ -35,6 +41,13 @@ func newRouter(logger *slog.Logger, start time.Time, now func() time.Time) http.
 	})
 
 	return requestLogger(logger, mux)
+}
+
+// newHandler builds the production HTTP handler with the full B3 surface
+// (healthz + REST + WebSocket) backed by mgr. Tests that need the real
+// server should call this instead of newRouter.
+func newHandler(mgr *room.Manager, logger *slog.Logger, start time.Time, now func() time.Time) http.Handler {
+	return transport.New(mgr, logger, start, now).Handler()
 }
 
 // requestLogger wraps a handler with structured access logging. It records the
@@ -63,4 +76,17 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("server: ResponseWriter does not implement http.Hijacker")
+}
+
+func (w *statusWriter) Flush() {
+	if fl, ok := w.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
 }

@@ -55,8 +55,15 @@ current one is confirmed passing.
     hammering + snapshot readers + leave/join churn) ✅; `go test ./...` clean ✅;
     `go test -race ./...` clean over 5 runs ✅ (98.8% coverage); `go vet` +
     `gofmt` clean ✅.
-- [ ] **B3 — Transport (HTTP + WebSocket)** ← next
-- [ ] **B4 — Durability: WAL + replay**
+- [x] **B3 — Transport (HTTP + WebSocket)** _(PR: b3-transport — this branch)_
+  - `internal/transport` (imports `engine` + `room` + `gorilla/websocket` + stdlib only; layering verified with `go list -deps`). Wired into `cmd/tessera` via `transport.New` — the process's `http.Server` now serves the full surface.
+  - **REST**: `POST /matches` (alias `/api/matches`) creates a match (`num_players`, `sequences_to_win` → `room_id`); `GET /matches` lists; `GET /matches/{id}?player_id=` renders a per-viewer snapshot (own hand only, board + 96 cells, chips, sequences, counts) for reconnect; `POST /matches/{id}/join` is idempotent. Errors map sentinels to `{code,message}` + correct HTTP status (400/404/409/410). See `docs/transport.md`.
+  - **WebSocket**: `GET /matches/{id}/ws?player_id=` (alias `/api/.../ws`) upgrades; per-connection goroutine + writer goroutine; typed envelope `{type, seq, payload}`. Client `move` (`move_id` mandatory, `expected_seq` optional optimistic concurrency, `place`/`remove`/`dead_card` + card/cell) → server is authoritative (seat from room table, never payload), `move_result` ack to mover + per-viewer `state` broadcast to all observers; `error` on rejection with `code` (`stale_seq`, `not_your_turn`, …) and current `seq`; `ping`/`pong`. The `seq` is `room.Seq` (the mailbox order B4 will log).
+  - **Idempotency & privacy**: `move_id` per `(player,move_id)` cached on acceptance; duplicate check before `ExpectedSeq`/rules so a late retry replays original ack (`duplicate:true`, no seq bump, no broadcast). Privacy via per-viewer `Snapshot` (room-owned) so no endpoint can leak opponent cards.
+  - **Reconnect**: WS `Join` is idempotent; a dropped socket is just a re-`Join` (no `Leave` on disconnect, seat held). Hub (`roomID → set{*wsClient}`) broadcasts per-viewer state after each accepted change; a retry of the same `move_id` does not broadcast.
+  - **Determinism**: rooms still derive `room-ids` and `room:<id>` streams from one `Seed`; same seed + same REST/WS move list → identical state (needed for B4 replay).
+  - Gate: REST unit tests (health, create/list, snapshot privacy, idempotent join, concurrent hammer) ✅; WS integration — two clients play a full game (`SequencesToWin=1` fast) through the server, 48–55 moves to win, every move `ExpectedSeq` + duplicate-retry verified, concurrent `go test -race` ✅; drop a socket mid-game, `GET` state for reconnect, re-dial with same `player_id`, resume and finish ✅; `stale_seq` and out-of-turn rejections ✅; both jack types + dead-card flows exercised ✅; `go vet` + `gofmt` clean ✅. See `internal/transport/*_test.go`.
+- [ ] **B4 — Durability: WAL + replay** ← next
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
 
