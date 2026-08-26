@@ -55,8 +55,28 @@ current one is confirmed passing.
     hammering + snapshot readers + leave/join churn) ✅; `go test ./...` clean ✅;
     `go test -race ./...` clean over 5 runs ✅ (98.8% coverage); `go vet` +
     `gofmt` clean ✅.
-- [ ] **B3 — Transport (HTTP + WebSocket)** ← next
-- [ ] **B4 — Durability: WAL + replay**
+- [x] **B3 — Transport (HTTP + WebSocket)** _(PR: b3-http-websocket-transport)_
+  - `internal/transport` exposes REST create/list/state endpoints and a typed
+    WebSocket envelope `{type, seq, payload}`. The process now wires the B2 room
+    manager into `cmd/tessera`; `/healthz` remains unchanged.
+  - One transport hub goroutine per match serializes socket join/disconnect/move
+    handling and broadcasts, preserving room sequence order. Each connection
+    has its own bounded writer queue; slow clients are disconnected rather than
+    blocking the match.
+  - Server authority and privacy carry through the wire: `player_id` maps to a
+    held room seat, move `seq` provides optimistic concurrency, `move_id`
+    retries replay the original ack, and state is rendered separately so each
+    player receives only their own hand.
+  - Reconnect: disconnect marks a held seat absent; `GET state?player_id=...`
+    restores authoritative private state; reopening the socket restores the
+    same seat and resumes play. See `docs/protocol.md`.
+  - WebSockets use `github.com/coder/websocket`, the one justified dependency
+    because the Go standard library does not implement the protocol.
+  - Gate: two real WebSocket clients play a full game through an HTTP test
+    server, including stale-seq rejection, duplicate retry, mid-game drop, REST
+    recovery, reconnect, and resume ✅; `go test ./...` ✅; `go test -race
+    -count=5 ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
+- [ ] **B4 — Durability: WAL + replay** ← next
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
 
