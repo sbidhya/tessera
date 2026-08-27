@@ -76,7 +76,26 @@ current one is confirmed passing.
     server, including stale-seq rejection, duplicate retry, mid-game drop, REST
     recovery, reconnect, and resume ✅; `go test ./...` ✅; `go test -race
     -count=5 ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
-- [ ] **B4 — Durability: WAL + replay** ← next
+- [x] **B4 — Durability: WAL + replay** _(PR: b4-wal-replay)_
+  - `internal/wal` — append-only per-match log `<WALDir>/<matchID>.wal`, one JSON
+    line per accepted command (`create`, `join`, `leave`, `move`). Every log
+    happens **before** the in-memory apply and before the ack (write-ahead);
+    `fsync` policy is configurable (`always` vs `off` via `TESSERA_WAL_FSYNC`).
+  - `internal/room` now defines the `WAL` interface and calls it before mutating:
+    join/leave log before `bump`; `playMove` validates on a `Clone` then logs
+    before adopting the clone. Rejected and duplicate moves are never re-logged.
+  - `internal/config`: new `WALDir`/`WALSync` fields (`TESSERA_WAL_DIR`,
+    `TESSERA_WAL_FSYNC`). `internal/engine.Clone` supports pre-validation.
+  - Recovery: `wal.Store.Replay` truncates any torn tail, recreates each room
+    deterministically from the same seed (`room:` stream), replays in log order,
+    dedupes via `move_id`/idempotent join, and wires the store for future
+    writes. See `docs/wal.md`.
+  - Wired into `cmd/tessera`: on startup replay the WAL (if configured) before
+    serving; `data/wal` is gitignored.
+  - Gate: kill mid-game (room and transport), restart with same dir+seed,
+    assert full `Snapshot` recovery and that the game continues; duplicate replay
+    (same `move_id` and second `Replay` call) is safe ✅; `go test ./...` ✅;
+    `go test -race -count=5 ./...` ✅; `go vet` + `gofmt` + layering check ✅.
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
 

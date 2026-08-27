@@ -29,6 +29,7 @@ type RandFunc func(stream string) *rand.Rand
 type Manager struct {
 	logger  *slog.Logger
 	randFor RandFunc
+	wal     WAL
 
 	mu     sync.Mutex
 	rooms  map[string]*Room
@@ -63,14 +64,56 @@ func (m *Manager) Create(opts engine.Options) (*Room, error) {
 	}
 
 	id := m.newIDLocked()
-	r, err := New(id, m.logger, m.randFor("room:"+id), opts)
+	// Validate by creating the game; this is the single place where bad opts
+	// fail, so a logged create always corresponds to a valid room.
+	rng := m.randFor("room:" + id)
+	r, err := NewWithWAL(id, m.logger, rng, opts, m.wal)
 	if err != nil {
 		return nil, err
+	}
+	// Write-ahead: the create is accepted — persist it before it becomes visible.
+	if m.wal != nil {
+		if err := m.wal.LogCreate(id, opts); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 	m.rooms[id] = r
 	m.logger.Info("room created", "room", id, "players", opts.NumPlayers,
 		"sequences_to_win", opts.SequencesToWin)
 	return r, nil
+}
+
+// Restore inserts a room that was rebuilt from the WAL (replay). It does not
+// log a new create record and does not advance the WAL. Used only by the
+// persistence layer during startup recovery.
+func (m *Manager) Restore(id string, opts engine.Options) (*Room, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrManagerClosed
+	}
+	if _, exists := m.rooms[id]; exists {
+		return nil, fmt.Errorf("room %s already exists", id)
+	}
+	rng := m.randFor("room:" + id)
+	r, err := New(id, m.logger, rng, opts)
+	if err != nil {
+		return nil, err
+	}
+	m.rooms[id] = r
+	return r, nil
+}
+
+// SetWAL attaches a WAL to the manager and to every existing room. It should
+// be called once at startup after replay and before serving traffic.
+func (m *Manager) SetWAL(w WAL) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.wal = w
+	for _, r := range m.rooms {
+		r.SetWAL(w)
+	}
 }
 
 // Get looks up a room by id.

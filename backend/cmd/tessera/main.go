@@ -13,6 +13,7 @@ import (
 	"github.com/sbidhya/tessera/backend/internal/config"
 	"github.com/sbidhya/tessera/backend/internal/room"
 	"github.com/sbidhya/tessera/backend/internal/transport"
+	"github.com/sbidhya/tessera/backend/internal/wal"
 )
 
 func main() {
@@ -41,6 +42,33 @@ func run() error {
 	logger.Debug("rng initialised", "seed", cfg.Seed, "sample", rng.Uint64())
 
 	manager := room.NewManager(logger, cfg.NewRand)
+
+	// Durability (B4): if a WAL directory is configured, replay the log to
+	// rebuild every match before serving, then wire the store for future
+	// write-ahead. The replay is idempotent — duplicate entries are deduped
+	// via move_id — so a crash between WAL and SQLite (B5) still recovers.
+	var walStore *wal.Store
+	if cfg.WALDir != "" {
+		policy, err := wal.ParseSyncPolicy(cfg.WALSync)
+		if err != nil {
+			logger.Error("invalid wal sync policy", "err", err)
+			return err
+		}
+		walStore, err = wal.New(cfg.WALDir, policy)
+		if err != nil {
+			logger.Error("open wal", "dir", cfg.WALDir, "err", err)
+			return err
+		}
+		if err := walStore.Replay(manager); err != nil {
+			logger.Error("wal replay failed", "err", err)
+			return err
+		}
+		if n := len(manager.List()); n > 0 {
+			logger.Info("wal replay complete", "rooms", n, "dir", cfg.WALDir)
+		}
+	} else {
+		logger.Info("wal disabled (no dir configured)")
+	}
 	api := transport.New(manager, logger)
 	defer func() {
 		api.Close()

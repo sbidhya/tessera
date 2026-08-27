@@ -198,6 +198,11 @@ type Room struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// wal is the durability hook. It is set at construction and never changes
+	// after the room starts serving; during WAL replay it is nil so replay
+	// does not re-log.
+	wal WAL
+
 	// ---- Everything below is owned exclusively by the room goroutine. ----
 	// No other goroutine may read or write these fields.
 	gs      *engine.GameState
@@ -216,6 +221,14 @@ type Room struct {
 // place where invalid Options can fail, so once a Room exists it always holds a
 // valid GameState. Play is gated on Status, not on whether the deal has happened.
 func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*Room, error) {
+	return NewWithWAL(id, logger, rng, opts, nil)
+}
+
+// NewWithWAL is like New but attaches a WAL hook. When wal is non-nil every
+// accepted state change is appended to the log BEFORE it is applied to the
+// in-memory state and before it is acked to the caller (write-ahead). If the
+// append fails the state is not mutated and the caller receives the error.
+func NewWithWAL(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options, wal WAL) (*Room, error) {
 	gs, err := engine.NewGame(rng, opts)
 	if err != nil {
 		return nil, fmt.Errorf("room %s: %w", id, err)
@@ -230,6 +243,7 @@ func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*
 		cmds:    make(chan command, mailboxSize),
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
+		wal:     wal,
 		gs:      gs,
 		status:  StatusWaiting,
 		seq:     1,
@@ -240,6 +254,11 @@ func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*
 	go r.loop()
 	return r, nil
 }
+
+// SetWAL attaches a WAL to an existing room. It is only safe to call before
+// the room serves traffic (during WAL replay wiring); concurrent use while
+// moves are in flight would race.
+func (r *Room) SetWAL(w WAL) { r.wal = w }
 
 // ID returns the room's identifier. Immutable, so no round-trip is needed.
 func (r *Room) ID() string { return r.id }
@@ -314,6 +333,11 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 		// Join while already present is a true no-op. This distinction lets B3
 		// broadcast presence changes without assigning two states the same version.
 		if !r.seats[s].present {
+			if r.wal != nil {
+				if err := r.wal.LogJoin(r.id, playerID); err != nil {
+					return JoinResult{}, err
+				}
+			}
 			r.seats[s].present = true
 			r.bump()
 		}
@@ -326,6 +350,12 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 	free := slices.IndexFunc(r.seats, func(s seat) bool { return s.playerID == "" })
 	if free < 0 {
 		return JoinResult{}, ErrRoomFull
+	}
+	// Write-ahead: log before mutating. New joins always change state.
+	if r.wal != nil {
+		if err := r.wal.LogJoin(r.id, playerID); err != nil {
+			return JoinResult{}, err
+		}
 	}
 	s := engine.PlayerID(free)
 	r.seats[free] = seat{playerID: playerID, present: true}
@@ -373,15 +403,22 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 			ErrStaleSeq, r.seq, req.ExpectedSeq)
 	}
 
-	// Player comes from the seat, never from the request. Out-of-turn and
-	// illegal-move rejection is the engine's job, and Apply is transactional:
-	// on error the state is untouched.
-	err := r.gs.Apply(engine.Move{Player: s, Type: req.Type, Card: req.Card, Cell: req.Cell})
-	if err != nil {
-		// A rejected move is deliberately NOT recorded as applied: it had no
-		// effect, so a corrected retry may reuse the id and be re-evaluated.
+	// Pre-validate on a clone so we only log accepted moves. Apply is
+	// transactional, but logging after Apply would leave a window where the
+	// in-memory state has advanced but the WAL has not (a crash would lose the
+	// move). Validating on a clone lets us log BEFORE mutating the real state.
+	clone := r.gs.Clone()
+	if err := clone.Apply(engine.Move{Player: s, Type: req.Type, Card: req.Card, Cell: req.Cell}); err != nil {
 		return MoveResult{}, err
 	}
+	// Write-ahead: the move is accepted — persist it before it becomes visible.
+	if r.wal != nil {
+		if err := r.wal.LogMove(r.id, req); err != nil {
+			return MoveResult{}, err
+		}
+	}
+	// Commit: clone already holds the post-move state, so adopt it.
+	r.gs = clone
 
 	r.bump()
 	if r.gs.GameOver() {
@@ -401,6 +438,18 @@ func (r *Room) leave(playerID string) error {
 	s, ok := r.bySeat[playerID]
 	if !ok {
 		return ErrNotSeated
+	}
+	// WAL is written before the state change, but only when the leave will
+	// actually change state. A duplicate leave for an already-absent player
+	// (as can happen during a WAL duplicate replay) is a no-op and must not
+	// bump seq or produce a second log entry.
+	if r.status != StatusWaiting && !r.seats[s].present {
+		return nil
+	}
+	if r.wal != nil {
+		if err := r.wal.LogLeave(r.id, playerID); err != nil {
+			return err
+		}
 	}
 	if r.status == StatusWaiting {
 		// Nothing has happened yet: release the seat so someone else can take it.
