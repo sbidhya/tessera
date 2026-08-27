@@ -35,4 +35,8 @@ var (
 	ErrNoSuchRoom = errors.New("room: no such room")
 	// ErrManagerClosed is returned by Manager.Create after Shutdown.
 	ErrManagerClosed = errors.New("room: manager is shut down")
+	// ErrDurability is returned when a state transition could not be made
+	// durable. The room remains unchanged, so a client may safely retry once
+	// storage is healthy (using the same move id for moves).
+	ErrDurability = errors.New("room: durability failure")
 )

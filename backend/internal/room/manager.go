@@ -29,6 +29,7 @@ type RandFunc func(stream string) *rand.Rand
 type Manager struct {
 	logger  *slog.Logger
 	randFor RandFunc
+	journal EventJournal
 
 	mu     sync.Mutex
 	rooms  map[string]*Room
@@ -39,12 +40,31 @@ type Manager struct {
 // NewManager builds an empty manager. randFor supplies each room's RNG stream,
 // so with a fixed process seed the whole set of matches is reproducible.
 func NewManager(logger *slog.Logger, randFor RandFunc) *Manager {
+	return newManager(logger, randFor, nil)
+}
+
+// NewDurableManager builds a manager backed by journal and replays every
+// recorded room before returning. No room goroutine starts until the complete
+// log has validated, so a corrupt WAL cannot expose partially recovered state.
+func NewDurableManager(logger *slog.Logger, randFor RandFunc, journal EventJournal) (*Manager, error) {
+	if journal == nil {
+		return nil, fmt.Errorf("room: durable manager requires an event journal")
+	}
+	m := newManager(logger, randFor, journal)
+	if err := m.recover(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Manager{
 		logger:  logger,
 		randFor: randFor,
+		journal: journal,
 		rooms:   make(map[string]*Room),
 		ids:     randFor("room-ids"),
 	}
@@ -63,14 +83,135 @@ func (m *Manager) Create(opts engine.Options) (*Room, error) {
 	}
 
 	id := m.newIDLocked()
-	r, err := New(id, m.logger, m.randFor("room:"+id), opts)
+	seedSource := m.randFor("room:" + id)
+	seed := [2]uint64{seedSource.Uint64(), seedSource.Uint64()}
+	r, err := newRoom(id, m.logger, rngFromSeed(seed), opts, m.journal)
 	if err != nil {
 		return nil, err
 	}
+	created := createdEvent(id, engine.Options{
+		NumPlayers:     r.gs.NumPlayers,
+		SequencesToWin: r.gs.SequencesToWin,
+	}, seed)
+	if err := r.append(created); err != nil {
+		return nil, err
+	}
+	r.start()
 	m.rooms[id] = r
-	m.logger.Info("room created", "room", id, "players", opts.NumPlayers,
-		"sequences_to_win", opts.SequencesToWin)
+	m.logger.Info("room created", "room", id, "players", r.gs.NumPlayers,
+		"sequences_to_win", r.gs.SequencesToWin)
 	return r, nil
+}
+
+func (m *Manager) recover() error {
+	events, err := m.journal.ReadAll()
+	if err != nil {
+		return fmt.Errorf("room: read journal: %w", err)
+	}
+	byRoom := make(map[string][]Event)
+	for _, event := range events {
+		if err := event.validate(); err != nil {
+			return fmt.Errorf("room: replay: %w", err)
+		}
+		byRoom[event.RoomID] = append(byRoom[event.RoomID], event)
+	}
+
+	ids := make([]string, 0, len(byRoom))
+	for id := range byRoom {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	recovered := make([]*Room, 0, len(ids))
+	for _, id := range ids {
+		r, err := replayRoom(id, m.logger, byRoom[id])
+		if err != nil {
+			return fmt.Errorf("room: replay %s: %w", id, err)
+		}
+		r.journal = m.journal
+		recovered = append(recovered, r)
+	}
+	for _, r := range recovered {
+		r.start()
+		m.rooms[r.id] = r
+	}
+	if len(recovered) > 0 {
+		m.logger.Info("rooms recovered", "count", len(recovered))
+	}
+	return nil
+}
+
+func replayRoom(id string, logger *slog.Logger, events []Event) (*Room, error) {
+	if len(events) == 0 {
+		return nil, fmt.Errorf("empty event stream")
+	}
+	created := events[0]
+	if created.Type != EventRoomCreated || created.Seq != 1 || created.RoomID != id {
+		return nil, fmt.Errorf("first event must create room at seq 1")
+	}
+	r, err := newRoom(id, logger, rngFromSeed(created.RNGSeed), created.Options, nil)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[uint64]Event{created.Seq: created}
+
+	for _, event := range events[1:] {
+		if previous, ok := seen[event.Seq]; ok {
+			if previous != event {
+				return nil, fmt.Errorf("conflicting events at seq %d", event.Seq)
+			}
+			continue
+		}
+		if event.Seq != r.seq+1 {
+			return nil, fmt.Errorf("event sequence gap: room at %d, next event is %d", r.seq, event.Seq)
+		}
+
+		switch event.Type {
+		case EventPlayerJoined:
+			result, err := r.join(event.PlayerID)
+			if err != nil {
+				return nil, fmt.Errorf("apply %s at seq %d: %w", event.Type, event.Seq, err)
+			}
+			if result.Seq != event.Seq {
+				return nil, fmt.Errorf("apply %s produced seq %d, want %d", event.Type, result.Seq, event.Seq)
+			}
+		case EventMoveApplied:
+			result, err := r.playMove(event.Move)
+			if err != nil {
+				return nil, fmt.Errorf("apply %s at seq %d: %w", event.Type, event.Seq, err)
+			}
+			if result.Duplicate || result.Seq != event.Seq {
+				return nil, fmt.Errorf("apply %s produced duplicate=%t seq=%d, want false/%d",
+					event.Type, result.Duplicate, result.Seq, event.Seq)
+			}
+		case EventPlayerLeft:
+			if err := r.leave(event.PlayerID); err != nil {
+				return nil, fmt.Errorf("apply %s at seq %d: %w", event.Type, event.Seq, err)
+			}
+			if r.seq != event.Seq {
+				return nil, fmt.Errorf("apply %s produced seq %d, want %d", event.Type, r.seq, event.Seq)
+			}
+		case EventRoomCreated:
+			return nil, fmt.Errorf("unexpected create event at seq %d", event.Seq)
+		default:
+			return nil, fmt.Errorf("unknown event type %q", event.Type)
+		}
+		seen[event.Seq] = event
+	}
+
+	// Network presence is process-local. A crash disconnects every socket even
+	// if the final durable event said a player was present; seats and game state
+	// remain, but clients must explicitly rejoin after restart.
+	for i := range r.seats {
+		if r.seats[i].playerID != "" {
+			r.seats[i].present = false
+		}
+	}
+	return r, nil
+}
+
+func rngFromSeed(seed [2]uint64) *rand.Rand {
+	return rand.New(rand.NewPCG(seed[0], seed[1]))
 }
 
 // Get looks up a room by id.

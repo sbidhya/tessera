@@ -76,7 +76,25 @@ current one is confirmed passing.
     server, including stale-seq rejection, duplicate retry, mid-game drop, REST
     recovery, reconnect, and resume ✅; `go test ./...` ✅; `go test -race
     -count=5 ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
-- [ ] **B4 — Durability: WAL + replay** ← next
+- [x] **B4 — Durability: WAL + replay** _(PR: b4-wal-replay)_
+  - `internal/wal` stores checksummed, length-framed events in one append-only
+    file per match. `TESSERA_WAL_SYNC=always` (the default) fsyncs the file and
+    new directory entry before acknowledgement; `never` is available for local
+    throughput experiments.
+  - The room actor owns the durability boundary through a small interface:
+    accepted joins, moves, and leaves are appended before authoritative state is
+    published. Moves are validated on a deep clone first, so a rejected command
+    or WAL failure leaves live state untouched.
+  - Creation records persist normalized options plus per-room PCG seed words.
+    Startup reconstructs rooms independently of the current process seed,
+    reapplies events in sequence order, rebuilds `move_id` acknowledgements, and
+    marks recovered seats disconnected until clients rejoin.
+  - Recovery accepts exact duplicate records idempotently, rejects sequence
+    gaps/conflicts/corruption, and truncates an incomplete final frame left by a
+    killed writer. See `docs/wal.md`.
+  - Gate: subprocess exits mid-game without cleanup and a fresh manager recovers
+    the board/turn/sequence plus duplicate ack ✅; `go test ./...` ✅; `go test
+    -race ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
 - [ ] **B5 — Cold tier: SQLite + write-behind**
 - [ ] **B6 — Matchmaking, presence, light auth**
 

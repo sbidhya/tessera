@@ -5,8 +5,10 @@ talks to a network. It owns *live* matches: one `Room` per match, holding that
 match's authoritative `engine.GameState`, plus a `Manager` that is the process's
 directory of rooms.
 
-It imports `engine` and the standard library — nothing else. Transport (B3), the
-WAL (B4) and the store (B5) will depend on this package, never the reverse.
+It imports `engine` and the standard library — nothing else. Transport and the
+concrete WAL depend on this package, never the reverse. The room exposes a tiny
+`EventJournal` interface so it can enforce append-before-apply without knowing
+anything about files or databases.
 
 ## One goroutine per match (the actor model)
 
@@ -118,10 +120,11 @@ future endpoint can forget them:
 
 ## Determinism
 
-`Manager` takes a `RandFunc` — satisfied by `config.Config.NewRand` — and gives
-each room its own named stream (`"room:"+id`), with room ids themselves drawn
-from a `"room-ids"` stream. So one process seed reproduces both the ids and the
-deals inside them, while no two rooms ever share a shuffle
+`Manager` takes a `RandFunc` — satisfied by `config.Config.NewRand` — and derives
+two PCG seed words from each room's named stream (`"room:"+id`), with room ids
+themselves drawn from a `"room-ids"` stream. Those room seed words are stored in
+the creation event, so an existing match replays identically even if the process
+seed later changes. No two rooms share a shuffle
 (`TestManagerIsDeterministic`, `TestManagerRoomsHaveIndependentStreams`).
 
 Room ids are random rather than sequential: until real auth lands in B6, knowing
@@ -139,6 +142,8 @@ context cancellation.
 
 ## What remains outside the room layer
 
-HTTP/WebSocket concerns stay in B3's `internal/transport`; persistence stays in
-B4/B5, and matchmaking/auth stay in B6. The room package remains unaware of all
-of them and continues to import only the engine and standard library.
+HTTP/WebSocket concerns stay in `internal/transport`; filesystem framing and
+sync policy stay in `internal/wal`; the SQLite cold tier stays in B5; and
+matchmaking/auth stay in B6. The room package knows only its persistence port
+and durable event values, and continues to import only the engine and standard
+library. See `docs/wal.md` for the B4 ordering and recovery design.
