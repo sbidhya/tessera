@@ -19,7 +19,7 @@ type healthResponse struct {
 // It lives in its own function (rather than being inlined in main) so tests can
 // exercise the exact routing/handlers the server uses without binding a socket.
 // start marks process boot so /healthz can report uptime.
-func newRouter(logger *slog.Logger, start time.Time, now func() time.Time) http.Handler {
+func newRouter(logger *slog.Logger, start time.Time, now func() time.Time, api http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +33,9 @@ func newRouter(logger *slog.Logger, start time.Time, now func() time.Time) http.
 			logger.Error("healthz: encode response", "err", err)
 		}
 	})
+	if api != nil {
+		mux.Handle("/v1/", api)
+	}
 
 	return requestLogger(logger, mux)
 }
@@ -59,6 +62,10 @@ type statusWriter struct {
 	http.ResponseWriter
 	status int
 }
+
+// Unwrap lets net/http.ResponseController reach optional interfaces on the
+// underlying writer (notably Hijacker for the WebSocket upgrade).
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code

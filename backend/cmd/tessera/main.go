@@ -1,8 +1,4 @@
 // Command tessera is the game backend entrypoint.
-//
-// B0 scope: load config, set up structured logging and a seeded RNG, and serve
-// a /healthz endpoint with graceful shutdown. Later blocks add the room manager,
-// WebSocket transport, WAL, and SQLite tiers behind this same process.
 package main
 
 import (
@@ -15,6 +11,8 @@ import (
 	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/config"
+	"github.com/sbidhya/tessera/backend/internal/room"
+	"github.com/sbidhya/tessera/backend/internal/transport"
 )
 
 func main() {
@@ -37,16 +35,22 @@ func run() error {
 
 	logger := cfg.Logger()
 
-	// Confirm the seeded RNG is wired; a later block will derive per-room and
-	// per-deck streams by name. Logging one draw from a probe stream at debug
-	// level makes the seed visible in dev without perturbing any real stream.
+	// Logging from a dedicated probe stream makes the configured seed observable
+	// without perturbing room ids or any game's board/deck streams.
 	rng := cfg.NewRand("startup-probe")
 	logger.Debug("rng initialised", "seed", cfg.Seed, "sample", rng.Uint64())
+
+	manager := room.NewManager(logger, cfg.NewRand)
+	api := transport.New(manager, logger)
+	defer func() {
+		api.Close()
+		manager.Shutdown()
+	}()
 
 	start := time.Now()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newRouter(logger, start, time.Now),
+		Handler:           newRouter(logger, start, time.Now, api.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -84,6 +88,9 @@ func run() error {
 		logger.Error("graceful shutdown failed", "err", err)
 		return err
 	}
+	// net/http does not wait for hijacked WebSocket connections. Close the
+	// transport explicitly so every socket and hub exits before rooms do.
+	api.Close()
 	logger.Info("shutdown complete")
 	return nil
 }

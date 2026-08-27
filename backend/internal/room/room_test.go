@@ -153,6 +153,7 @@ func TestLeaveBeforeStartFreesSeat(t *testing.T) {
 
 func TestLeaveDuringMatchHoldsSeatForReconnect(t *testing.T) {
 	r := seatedRoom(t, 2)
+	before := mustSnapshot(t, r, "alice")
 
 	if err := r.Leave(t.Context(), "alice"); err != nil {
 		t.Fatalf("Leave: %v", err)
@@ -177,6 +178,14 @@ func TestLeaveDuringMatchHoldsSeatForReconnect(t *testing.T) {
 	back := mustJoin(t, r, "alice")
 	if !back.Rejoined || back.Seat != 0 {
 		t.Errorf("alice reconnect = %+v, want rejoin into seat 0", back)
+	}
+	if back.Seq != before.Seq+2 { // one bump for Leave, one for becoming present
+		t.Errorf("reconnect seq = %d, want %d", back.Seq, before.Seq+2)
+	}
+	after := mustSnapshot(t, r, "bob")
+	idx = slices.IndexFunc(after.Players, func(p PlayerInfo) bool { return p.ID == "alice" })
+	if idx < 0 || !after.Players[idx].Present {
+		t.Error("alice should be present after reconnect")
 	}
 }
 

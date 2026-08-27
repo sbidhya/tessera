@@ -82,15 +82,16 @@ happy to let the engine's turn check arbitrate.
 
 `ExpectedSeq` subsumes the "expected turn" idea from the project brief: the turn
 is part of the state that `Seq` versions, and a stricter check costs nothing
-when it is opt-in. B3 will reuse the same counter to order broadcasts.
+when it is opt-in. B3 uses the same counter to order broadcasts.
 
 ## Seats, leaving, and reconnection
 
 Players are identified by an opaque string id (real identity arrives in B6). The
 room maps player id → engine seat, and **Join is idempotent**: a player already
-in the room gets their existing seat back, with no state change and no seq bump.
-Reconnection is therefore just "Join again", which is the whole flow B3's
-reconnect gate needs.
+in the room always gets their existing seat back. Joining while already present
+is a no-op; rejoining after a disconnect changes `Present` from false to true
+and therefore bumps `Seq` once. Reconnection is still just "Join again", while
+every observable presence state keeps a distinct version.
 
 `Leave` is deliberately asymmetric:
 
@@ -136,8 +137,8 @@ caller waiting on a reply also selects on `done` (and on its own
 never blocks handing a result to a caller that has already walked away on
 context cancellation.
 
-## Not in this block
+## What remains outside the room layer
 
-No HTTP or WebSocket surface (B3), no event broadcast/subscription (B3), no
-persistence (B4/B5), no matchmaking (B6). The room manager is not yet wired into
-`cmd/tessera`; it gets its entrypoint when transport arrives.
+HTTP/WebSocket concerns stay in B3's `internal/transport`; persistence stays in
+B4/B5, and matchmaking/auth stay in B6. The room package remains unaware of all
+of them and continues to import only the engine and standard library.

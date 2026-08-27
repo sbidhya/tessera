@@ -145,6 +145,10 @@ type Snapshot struct {
 	Status Status
 	Turn   engine.PlayerID
 	Winner engine.PlayerID
+	// NumPlayers and SequencesToWin are immutable match settings included so
+	// outer layers can describe a room without reaching into engine state.
+	NumPlayers     int
+	SequencesToWin int
 
 	// Viewer is the seat this snapshot was rendered for, or engine.NoPlayer for
 	// a spectator (an unknown or empty viewer id).
@@ -305,9 +309,14 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 		return JoinResult{}, ErrInvalidPlayerID
 	}
 	if s, ok := r.bySeat[playerID]; ok {
-		// Idempotent rejoin: same seat, no state change, no seq bump. A client
-		// that reconnects mid-match lands exactly where it left off.
-		r.seats[s].present = true
+		// Rejoining always returns the same seat. Transitioning from disconnected
+		// to present is observable state, so it advances seq exactly once; another
+		// Join while already present is a true no-op. This distinction lets B3
+		// broadcast presence changes without assigning two states the same version.
+		if !r.seats[s].present {
+			r.seats[s].present = true
+			r.bump()
+		}
 		return JoinResult{Seat: s, Rejoined: true, Seq: r.seq, Status: r.status}, nil
 	}
 	if r.status == StatusFinished {
@@ -418,19 +427,21 @@ func (r *Room) snapshot(viewer string) Snapshot {
 	}
 
 	snap := Snapshot{
-		RoomID:        r.id,
-		Seq:           r.seq,
-		Status:        r.status,
-		Turn:          r.gs.Turn,
-		Winner:        r.gs.Winner,
-		Viewer:        seatOf,
-		HandCounts:    make(map[engine.PlayerID]int, len(r.seats)),
-		Board:         r.gs.Board,
-		Chips:         maps.Clone(r.gs.Chips),
-		Sequences:     slices.Clone(r.gs.Sequences),
-		SequencesWon:  maps.Clone(r.gs.SequencesWon),
-		DrawRemaining: len(r.gs.Draw),
-		Players:       make([]PlayerInfo, 0, len(r.seats)),
+		RoomID:         r.id,
+		Seq:            r.seq,
+		Status:         r.status,
+		Turn:           r.gs.Turn,
+		Winner:         r.gs.Winner,
+		NumPlayers:     r.gs.NumPlayers,
+		SequencesToWin: r.gs.SequencesToWin,
+		Viewer:         seatOf,
+		HandCounts:     make(map[engine.PlayerID]int, len(r.seats)),
+		Board:          r.gs.Board,
+		Chips:          maps.Clone(r.gs.Chips),
+		Sequences:      slices.Clone(r.gs.Sequences),
+		SequencesWon:   maps.Clone(r.gs.SequencesWon),
+		DrawRemaining:  len(r.gs.Draw),
+		Players:        make([]PlayerInfo, 0, len(r.seats)),
 	}
 	for i := range r.seats {
 		p := engine.PlayerID(i)
