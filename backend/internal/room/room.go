@@ -188,8 +188,9 @@ type moveKey struct {
 // they submit a command to the room's loop and wait for the reply.
 type Room struct {
 	// Immutable after construction, so readable from any goroutine.
-	id     string
-	logger *slog.Logger
+	id      string
+	logger  *slog.Logger
+	journal EventJournal
 
 	cmds chan command
 	// quit is closed by Close to ask the loop to stop; done is closed by the
@@ -216,6 +217,18 @@ type Room struct {
 // place where invalid Options can fail, so once a Room exists it always holds a
 // valid GameState. Play is gated on Status, not on whether the deal has happened.
 func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*Room, error) {
+	r, err := newRoom(id, logger, rng, opts, nil)
+	if err != nil {
+		return nil, err
+	}
+	r.start()
+	return r, nil
+}
+
+// newRoom constructs but does not start a room. Manager uses the unstarted
+// form so it can durably record creation (or replay existing events) before any
+// caller can submit commands.
+func newRoom(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options, journal EventJournal) (*Room, error) {
 	gs, err := engine.NewGame(rng, opts)
 	if err != nil {
 		return nil, fmt.Errorf("room %s: %w", id, err)
@@ -227,6 +240,7 @@ func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*
 	r := &Room{
 		id:      id,
 		logger:  logger.With("room", id),
+		journal: journal,
 		cmds:    make(chan command, mailboxSize),
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -237,9 +251,10 @@ func New(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options) (*
 		bySeat:  make(map[string]engine.PlayerID, opts.NumPlayers),
 		applied: make(map[moveKey]MoveResult),
 	}
-	go r.loop()
 	return r, nil
 }
+
+func (r *Room) start() { go r.loop() }
 
 // ID returns the room's identifier. Immutable, so no round-trip is needed.
 func (r *Room) ID() string { return r.id }
@@ -314,6 +329,15 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 		// Join while already present is a true no-op. This distinction lets B3
 		// broadcast presence changes without assigning two states the same version.
 		if !r.seats[s].present {
+			if err := r.append(Event{
+				Version:  EventVersion,
+				Type:     EventPlayerJoined,
+				RoomID:   r.id,
+				Seq:      r.seq + 1,
+				PlayerID: playerID,
+			}); err != nil {
+				return JoinResult{}, err
+			}
 			r.seats[s].present = true
 			r.bump()
 		}
@@ -328,6 +352,15 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 		return JoinResult{}, ErrRoomFull
 	}
 	s := engine.PlayerID(free)
+	if err := r.append(Event{
+		Version:  EventVersion,
+		Type:     EventPlayerJoined,
+		RoomID:   r.id,
+		Seq:      r.seq + 1,
+		PlayerID: playerID,
+	}); err != nil {
+		return JoinResult{}, err
+	}
 	r.seats[free] = seat{playerID: playerID, present: true}
 	r.bySeat[playerID] = s
 	r.bump()
@@ -373,19 +406,35 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 			ErrStaleSeq, r.seq, req.ExpectedSeq)
 	}
 
-	// Player comes from the seat, never from the request. Out-of-turn and
-	// illegal-move rejection is the engine's job, and Apply is transactional:
-	// on error the state is untouched.
-	err := r.gs.Apply(engine.Move{Player: s, Type: req.Type, Card: req.Card, Cell: req.Cell})
+	// Prepare the complete next game state on a clone. This both validates the
+	// move and lets us write the accepted command BEFORE making it authoritative.
+	// Once the WAL append succeeds, publishing the clone cannot fail.
+	next := r.gs.Clone()
+	err := next.Apply(engine.Move{Player: s, Type: req.Type, Card: req.Card, Cell: req.Cell})
 	if err != nil {
 		// A rejected move is deliberately NOT recorded as applied: it had no
 		// effect, so a corrected retry may reuse the id and be re-evaluated.
 		return MoveResult{}, err
 	}
+	nextStatus := r.status
+	if next.GameOver() {
+		nextStatus = StatusFinished
+	}
+	nextSeq := r.seq + 1
+	if err := r.append(Event{
+		Version: EventVersion,
+		Type:    EventMoveApplied,
+		RoomID:  r.id,
+		Seq:     nextSeq,
+		Move:    req,
+	}); err != nil {
+		return MoveResult{}, err
+	}
 
-	r.bump()
-	if r.gs.GameOver() {
-		r.status = StatusFinished
+	r.gs = next
+	r.seq = nextSeq
+	r.status = nextStatus
+	if r.status == StatusFinished {
 		r.logger.Info("match finished", "winner", r.gs.Winner, "seq", r.seq)
 	}
 	res := MoveResult{Seq: r.seq, Status: r.status, Turn: r.gs.Turn, Winner: r.gs.Winner}
@@ -401,6 +450,15 @@ func (r *Room) leave(playerID string) error {
 	s, ok := r.bySeat[playerID]
 	if !ok {
 		return ErrNotSeated
+	}
+	if err := r.append(Event{
+		Version:  EventVersion,
+		Type:     EventPlayerLeft,
+		RoomID:   r.id,
+		Seq:      r.seq + 1,
+		PlayerID: playerID,
+	}); err != nil {
+		return err
 	}
 	if r.status == StatusWaiting {
 		// Nothing has happened yet: release the seat so someone else can take it.
@@ -475,4 +533,17 @@ func (r *Room) occupied() int {
 		}
 	}
 	return n
+}
+
+// append makes a state transition durable. A nil journal is the intentionally
+// in-memory mode used by B2 tests and embedders that do not opt into B4.
+func (r *Room) append(event Event) error {
+	if r.journal == nil {
+		return nil
+	}
+	if err := r.journal.Append(event); err != nil {
+		return fmt.Errorf("%w: append %s for room %s at seq %d: %w",
+			ErrDurability, event.Type, r.id, event.Seq, err)
+	}
+	return nil
 }

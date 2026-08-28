@@ -35,6 +35,11 @@ type Config struct {
 	Seed int64
 	// LogLevel is the minimum slog level to emit: debug, info, warn, error.
 	LogLevel slog.Level
+	// WALDir is the directory containing one append-only log per match.
+	WALDir string
+	// WALSync controls acknowledgement durability: "always" fsyncs every
+	// accepted event, while "never" relies on the operating system's flushing.
+	WALSync string
 }
 
 // Default returns the built-in configuration used when no environment
@@ -44,6 +49,8 @@ func Default() Config {
 		Addr:     ":8080",
 		Seed:     1,
 		LogLevel: slog.LevelInfo,
+		WALDir:   "data/wal",
+		WALSync:  "always",
 	}
 }
 
@@ -53,6 +60,8 @@ func Default() Config {
 //	TESSERA_ADDR       -> Addr       (string)
 //	TESSERA_SEED       -> Seed       (int64)
 //	TESSERA_LOG_LEVEL  -> LogLevel   (debug|info|warn|error)
+//	TESSERA_WAL_DIR    -> WALDir     (directory path)
+//	TESSERA_WAL_SYNC   -> WALSync    (always|never)
 //
 // It returns an error rather than silently falling back so a typo in a
 // deployment env var fails loudly instead of running with a surprising value.
@@ -77,6 +86,19 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, err
 		}
 		cfg.LogLevel = lvl
+	}
+
+	if v := getenv("TESSERA_WAL_DIR"); v != "" {
+		cfg.WALDir = v
+	}
+
+	if v := getenv("TESSERA_WAL_SYNC"); v != "" {
+		switch v {
+		case "always", "never":
+			cfg.WALSync = v
+		default:
+			return Config{}, fmt.Errorf("config: invalid TESSERA_WAL_SYNC %q (want always or never)", v)
+		}
 	}
 
 	return cfg, nil

@@ -21,6 +21,9 @@ func TestDefault(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want Info", cfg.LogLevel)
 	}
+	if cfg.WALDir != "data/wal" || cfg.WALSync != "always" {
+		t.Errorf("WAL defaults = %q/%q, want data/wal/always", cfg.WALDir, cfg.WALSync)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -28,6 +31,8 @@ func TestLoadOverrides(t *testing.T) {
 		"TESSERA_ADDR":      ":9999",
 		"TESSERA_SEED":      "42",
 		"TESSERA_LOG_LEVEL": "debug",
+		"TESSERA_WAL_DIR":   "/tmp/tessera-wal",
+		"TESSERA_WAL_SYNC":  "never",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -40,6 +45,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.LogLevel != slog.LevelDebug {
 		t.Errorf("LogLevel = %v, want Debug", cfg.LogLevel)
+	}
+	if cfg.WALDir != "/tmp/tessera-wal" || cfg.WALSync != "never" {
+		t.Errorf("WAL config = %q/%q, want /tmp/tessera-wal/never", cfg.WALDir, cfg.WALSync)
 	}
 }
 
@@ -64,6 +72,13 @@ func TestLoadInvalidLogLevel(t *testing.T) {
 	_, err := Load(envFunc(map[string]string{"TESSERA_LOG_LEVEL": "chatty"}))
 	if err == nil {
 		t.Fatal("expected error for invalid log level, got nil")
+	}
+}
+
+func TestLoadInvalidWALSync(t *testing.T) {
+	_, err := Load(envFunc(map[string]string{"TESSERA_WAL_SYNC": "sometimes"}))
+	if err == nil {
+		t.Fatal("expected error for invalid WAL sync policy, got nil")
 	}
 }
 

@@ -43,6 +43,17 @@ func newTestBackend(t *testing.T, seed int64) *testBackend {
 	return b
 }
 
+func TestDurabilityFailureMapsToServiceUnavailable(t *testing.T) {
+	status, code := httpError(room.ErrDurability)
+	if status != http.StatusServiceUnavailable || code != "durability_failure" {
+		t.Errorf("httpError(ErrDurability) = %d/%q, want %d/durability_failure",
+			status, code, http.StatusServiceUnavailable)
+	}
+	if code := errorCode(room.ErrDurability); code != "durability_failure" {
+		t.Errorf("errorCode(ErrDurability) = %q, want durability_failure", code)
+	}
+}
+
 func TestRESTCreateListAndGetState(t *testing.T) {
 	b := newTestBackend(t, 1)
 	created := createMatch(t, b.http.URL, 1)

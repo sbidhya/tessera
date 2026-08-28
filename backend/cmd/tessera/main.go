@@ -13,6 +13,7 @@ import (
 	"github.com/sbidhya/tessera/backend/internal/config"
 	"github.com/sbidhya/tessera/backend/internal/room"
 	"github.com/sbidhya/tessera/backend/internal/transport"
+	"github.com/sbidhya/tessera/backend/internal/wal"
 )
 
 func main() {
@@ -40,11 +41,30 @@ func run() error {
 	rng := cfg.NewRand("startup-probe")
 	logger.Debug("rng initialised", "seed", cfg.Seed, "sample", rng.Uint64())
 
-	manager := room.NewManager(logger, cfg.NewRand)
+	syncPolicy, err := wal.ParseSyncPolicy(cfg.WALSync)
+	if err != nil {
+		logger.Error("configure WAL", "err", err)
+		return err
+	}
+	journal, err := wal.Open(cfg.WALDir, syncPolicy)
+	if err != nil {
+		logger.Error("open WAL", "err", err)
+		return err
+	}
+
+	manager, err := room.NewDurableManager(logger, cfg.NewRand, journal)
+	if err != nil {
+		_ = journal.Close()
+		logger.Error("recover rooms", "err", err)
+		return err
+	}
 	api := transport.New(manager, logger)
 	defer func() {
 		api.Close()
 		manager.Shutdown()
+		if err := journal.Close(); err != nil {
+			logger.Error("close WAL", "err", err)
+		}
 	}()
 
 	start := time.Now()

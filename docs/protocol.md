@@ -148,7 +148,8 @@ Rejected moves do not change `seq`:
 Stable codes cover membership (`room_full`, `not_seated`), concurrency
 (`stale_seq`, `missing_move_id`), turn/rule failures (`not_your_turn`,
 `card_not_in_hand`, `cell_occupied`, and related engine errors), malformed
-messages, and shutdown.
+messages, shutdown, and `durability_failure` when an accepted transition could
+not be written safely. A durability failure leaves the live state unchanged.
 
 ## Reconnect flow
 

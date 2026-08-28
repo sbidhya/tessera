@@ -269,6 +269,8 @@ func httpError(err error) (int, string) {
 		return http.StatusNotFound, "match_not_found"
 	case errors.Is(err, room.ErrManagerClosed), errors.Is(err, room.ErrRoomClosed):
 		return http.StatusServiceUnavailable, "server_closed"
+	case errors.Is(err, room.ErrDurability):
+		return http.StatusServiceUnavailable, "durability_failure"
 	default:
 		return http.StatusUnprocessableEntity, errorCode(err)
 	}
@@ -292,6 +294,8 @@ func errorCode(err error) string {
 		return "stale_seq"
 	case errors.Is(err, room.ErrRoomClosed), errors.Is(err, room.ErrManagerClosed):
 		return "server_closed"
+	case errors.Is(err, room.ErrDurability):
+		return "durability_failure"
 	case errors.Is(err, engine.ErrNotYourTurn):
 		return "not_your_turn"
 	case errors.Is(err, engine.ErrUnknownPlayer):
