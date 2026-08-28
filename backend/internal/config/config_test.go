@@ -3,6 +3,7 @@ package config
 import (
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // envFunc builds a getenv-style lookup from a map for hermetic tests.
@@ -24,15 +25,21 @@ func TestDefault(t *testing.T) {
 	if cfg.WALDir != "data/wal" || cfg.WALSync != "always" {
 		t.Errorf("WAL defaults = %q/%q, want data/wal/always", cfg.WALDir, cfg.WALSync)
 	}
+	if cfg.DBPath != "data/tessera.db" || cfg.StoreBatchSize != 16 || cfg.StoreFlushInterval != time.Second {
+		t.Errorf("store defaults = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(envFunc(map[string]string{
-		"TESSERA_ADDR":      ":9999",
-		"TESSERA_SEED":      "42",
-		"TESSERA_LOG_LEVEL": "debug",
-		"TESSERA_WAL_DIR":   "/tmp/tessera-wal",
-		"TESSERA_WAL_SYNC":  "never",
+		"TESSERA_ADDR":                 ":9999",
+		"TESSERA_SEED":                 "42",
+		"TESSERA_LOG_LEVEL":            "debug",
+		"TESSERA_WAL_DIR":              "/tmp/tessera-wal",
+		"TESSERA_WAL_SYNC":             "never",
+		"TESSERA_DB_PATH":              "/tmp/tessera.db",
+		"TESSERA_STORE_BATCH_SIZE":     "8",
+		"TESSERA_STORE_FLUSH_INTERVAL": "250ms",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -48,6 +55,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.WALDir != "/tmp/tessera-wal" || cfg.WALSync != "never" {
 		t.Errorf("WAL config = %q/%q, want /tmp/tessera-wal/never", cfg.WALDir, cfg.WALSync)
+	}
+	if cfg.DBPath != "/tmp/tessera.db" || cfg.StoreBatchSize != 8 || cfg.StoreFlushInterval != 250*time.Millisecond {
+		t.Errorf("store config = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
 	}
 }
 
@@ -79,6 +89,19 @@ func TestLoadInvalidWALSync(t *testing.T) {
 	_, err := Load(envFunc(map[string]string{"TESSERA_WAL_SYNC": "sometimes"}))
 	if err == nil {
 		t.Fatal("expected error for invalid WAL sync policy, got nil")
+	}
+}
+
+func TestLoadInvalidStoreConfig(t *testing.T) {
+	for key, value := range map[string]string{
+		"TESSERA_STORE_BATCH_SIZE":     "0",
+		"TESSERA_STORE_FLUSH_INTERVAL": "soon",
+	} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := Load(envFunc(map[string]string{key: value})); err == nil {
+				t.Fatalf("expected error for %s=%q", key, value)
+			}
+		})
 	}
 }
 

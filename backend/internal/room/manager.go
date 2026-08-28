@@ -30,6 +30,7 @@ type Manager struct {
 	logger  *slog.Logger
 	randFor RandFunc
 	journal EventJournal
+	archive FinishedMatchSink
 
 	mu     sync.Mutex
 	rooms  map[string]*Room
@@ -40,24 +41,32 @@ type Manager struct {
 // NewManager builds an empty manager. randFor supplies each room's RNG stream,
 // so with a fixed process seed the whole set of matches is reproducible.
 func NewManager(logger *slog.Logger, randFor RandFunc) *Manager {
-	return newManager(logger, randFor, nil)
+	return newManager(logger, randFor, nil, nil)
 }
 
 // NewDurableManager builds a manager backed by journal and replays every
 // recorded room before returning. No room goroutine starts until the complete
 // log has validated, so a corrupt WAL cannot expose partially recovered state.
 func NewDurableManager(logger *slog.Logger, randFor RandFunc, journal EventJournal) (*Manager, error) {
+	return NewPersistentManager(logger, randFor, journal, nil)
+}
+
+// NewPersistentManager builds a durable manager and sends each completed match
+// to archive. Recovery also re-emits a terminal match whose WAL survived a
+// crash before SQLite was committed; the cold tier's idempotent transaction
+// makes that retry safe.
+func NewPersistentManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink) (*Manager, error) {
 	if journal == nil {
 		return nil, fmt.Errorf("room: durable manager requires an event journal")
 	}
-	m := newManager(logger, randFor, journal)
+	m := newManager(logger, randFor, journal, archive)
 	if err := m.recover(); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal) *Manager {
+func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -65,6 +74,7 @@ func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal) *Ma
 		logger:  logger,
 		randFor: randFor,
 		journal: journal,
+		archive: archive,
 		rooms:   make(map[string]*Room),
 		ids:     randFor("room-ids"),
 	}
@@ -96,6 +106,7 @@ func (m *Manager) Create(opts engine.Options) (*Room, error) {
 	if err := r.append(created); err != nil {
 		return nil, err
 	}
+	r.archive = m.archive
 	r.start()
 	m.rooms[id] = r
 	m.logger.Info("room created", "room", id, "players", r.gs.NumPlayers,
@@ -129,9 +140,16 @@ func (m *Manager) recover() error {
 			return fmt.Errorf("room: replay %s: %w", id, err)
 		}
 		r.journal = m.journal
+		r.archive = m.archive
 		recovered = append(recovered, r)
 	}
 	for _, r := range recovered {
+		// Notify before the actor starts, while direct access to its fields is
+		// still safe. A finished WAL left behind by a crash is thereby queued for
+		// the same idempotent SQLite write as a newly completed match.
+		if r.status == StatusFinished && r.archive != nil {
+			r.archive.MatchFinished(r.finishedMatch())
+		}
 		r.start()
 		m.rooms[r.id] = r
 	}
@@ -154,6 +172,7 @@ func replayRoom(id string, logger *slog.Logger, events []Event) (*Room, error) {
 		return nil, err
 	}
 	seen := map[uint64]Event{created.Seq: created}
+	r.events = append(r.events, created)
 
 	for _, event := range events[1:] {
 		if previous, ok := seen[event.Seq]; ok {
@@ -168,6 +187,12 @@ func replayRoom(id string, logger *slog.Logger, events []Event) (*Room, error) {
 
 		switch event.Type {
 		case EventPlayerJoined:
+			if r.status == StatusFinished {
+				if err := r.replayFinishedPresence(event); err != nil {
+					return nil, fmt.Errorf("apply legacy %s at seq %d: %w", event.Type, event.Seq, err)
+				}
+				break
+			}
 			result, err := r.join(event.PlayerID)
 			if err != nil {
 				return nil, fmt.Errorf("apply %s at seq %d: %w", event.Type, event.Seq, err)
@@ -185,6 +210,12 @@ func replayRoom(id string, logger *slog.Logger, events []Event) (*Room, error) {
 					event.Type, result.Duplicate, result.Seq, event.Seq)
 			}
 		case EventPlayerLeft:
+			if r.status == StatusFinished {
+				if err := r.replayFinishedPresence(event); err != nil {
+					return nil, fmt.Errorf("apply legacy %s at seq %d: %w", event.Type, event.Seq, err)
+				}
+				break
+			}
 			if err := r.leave(event.PlayerID); err != nil {
 				return nil, fmt.Errorf("apply %s at seq %d: %w", event.Type, event.Seq, err)
 			}

@@ -48,6 +48,40 @@ type EventJournal interface {
 	ReadAll() ([]Event, error)
 }
 
+// FinishedPlayer is the durable, public result for one seat. It intentionally
+// omits transient presence and private hand data: the cold tier needs match
+// outcomes, not a copy of connection state or hidden cards.
+type FinishedPlayer struct {
+	ID        string
+	Seat      engine.PlayerID
+	Sequences int
+	Won       bool
+}
+
+// FinishedMatch is the persistence-neutral archive handed to the cold tier
+// after the winning move is safely in the WAL and published in memory.
+// History contains the accepted events through FinishedSeq in authoritative
+// room order, allowing SQLite to serve a complete audit trail without parsing
+// live room internals.
+type FinishedMatch struct {
+	RoomID         string
+	FinishedSeq    uint64
+	NumPlayers     int
+	SequencesToWin int
+	Winner         engine.PlayerID
+	Players        []FinishedPlayer
+	History        []Event
+}
+
+// FinishedMatchSink receives terminal matches for asynchronous cold storage.
+// Implementations must make MatchFinished a quick enqueue operation: it runs on
+// the room actor after the terminal state is committed but before its caller is
+// acknowledged. The WAL remains the recovery source until the sink later
+// checkpoints it, so enqueueing does not need to synchronously touch SQLite.
+type FinishedMatchSink interface {
+	MatchFinished(FinishedMatch)
+}
+
 func createdEvent(id string, opts engine.Options, seed [2]uint64) Event {
 	return Event{
 		Version: EventVersion,

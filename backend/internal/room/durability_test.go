@@ -2,6 +2,7 @@ package room
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -14,6 +15,14 @@ type memoryJournal struct {
 	mu     sync.Mutex
 	events []Event
 	fail   error
+}
+
+type captureArchive struct {
+	matches chan FinishedMatch
+}
+
+func (a *captureArchive) MatchFinished(match FinishedMatch) {
+	a.matches <- match
 }
 
 func (j *memoryJournal) Append(event Event) error {
@@ -233,4 +242,101 @@ func TestRejectedCommandIsNotLogged(t *testing.T) {
 	if len(after) != len(before) {
 		t.Errorf("rejected command appended an event: %d -> %d", len(before), len(after))
 	}
+}
+
+func TestFinishedMatchIsArchivedOnceAndBecomesImmutable(t *testing.T) {
+	journal := &memoryJournal{}
+	archive := &captureArchive{matches: make(chan FinishedMatch, 2)}
+	cfg := config.Config{Seed: 51}
+	m, err := NewPersistentManager(testLogger(), cfg.NewRand, journal, archive)
+	if err != nil {
+		t.Fatalf("NewPersistentManager: %v", err)
+	}
+	t.Cleanup(m.Shutdown)
+	r, err := m.Create(engine.Options{NumPlayers: 2, SequencesToWin: 1})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	mustJoin(t, r, "alice")
+	mustJoin(t, r, "bob")
+	finishTestRoom(t, r)
+
+	archived := <-archive.matches
+	if archived.RoomID != r.ID() || archived.History[len(archived.History)-1].Seq != archived.FinishedSeq {
+		t.Fatalf("archive = %+v", archived)
+	}
+	if len(archive.matches) != 0 {
+		t.Fatal("match was archived more than once")
+	}
+	eventsBefore, _ := journal.ReadAll()
+	seqBefore := mustSnapshot(t, r, "alice").Seq
+	if err := r.Leave(t.Context(), "alice"); err != nil {
+		t.Fatalf("post-finish Leave: %v", err)
+	}
+	if _, err := r.Join(t.Context(), "alice"); err != nil {
+		t.Fatalf("post-finish Join: %v", err)
+	}
+	eventsAfter, _ := journal.ReadAll()
+	if len(eventsAfter) != len(eventsBefore) || mustSnapshot(t, r, "alice").Seq != seqBefore {
+		t.Error("finished match accepted a post-terminal presence transition")
+	}
+}
+
+func TestRecoveryAcceptsB4PostFinishPresenceEvents(t *testing.T) {
+	journal := &memoryJournal{}
+	first := durableTestManager(t, 52, journal)
+	r, err := first.Create(engine.Options{NumPlayers: 2, SequencesToWin: 1})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	mustJoin(t, r, "alice")
+	mustJoin(t, r, "bob")
+	finishTestRoom(t, r)
+	terminal := mustSnapshot(t, r, "").Seq
+	first.Shutdown()
+
+	// B4 allowed disconnect/reconnect events after a match ended. Preserve the
+	// ability to upgrade and archive those existing logs even though B5 no longer
+	// writes post-terminal presence changes.
+	journal.mu.Lock()
+	journal.events = append(journal.events,
+		Event{Version: EventVersion, Type: EventPlayerLeft, RoomID: r.ID(), Seq: terminal + 1, PlayerID: "alice"},
+		Event{Version: EventVersion, Type: EventPlayerJoined, RoomID: r.ID(), Seq: terminal + 2, PlayerID: "alice"},
+	)
+	journal.mu.Unlock()
+
+	archive := &captureArchive{matches: make(chan FinishedMatch, 1)}
+	cfg := config.Config{Seed: 999}
+	recovered, err := NewPersistentManager(testLogger(), cfg.NewRand, journal, archive)
+	if err != nil {
+		t.Fatalf("recover B4 WAL: %v", err)
+	}
+	t.Cleanup(recovered.Shutdown)
+	archived := <-archive.matches
+	if archived.FinishedSeq != terminal+2 || len(archived.History) != int(terminal+2) {
+		t.Errorf("archive seq/history = %d/%d, want %d/%d",
+			archived.FinishedSeq, len(archived.History), terminal+2, terminal+2)
+	}
+}
+
+func finishTestRoom(t *testing.T, r *Room) {
+	t.Helper()
+	players := []string{"alice", "bob"}
+	for move := 0; move < 5000; move++ {
+		snap := mustSnapshot(t, r, "")
+		if snap.Status == StatusFinished {
+			return
+		}
+		view := mustSnapshot(t, r, players[snap.Turn])
+		req, ok := chooseMove(view)
+		if !ok {
+			t.Fatalf("no move after %d plays", move)
+		}
+		req.PlayerID = players[view.Viewer]
+		req.MoveID = fmt.Sprintf("archive-%d", move)
+		if _, err := r.PlayMove(t.Context(), req); err != nil {
+			t.Fatalf("move %d: %v", move, err)
+		}
+	}
+	t.Fatal("match did not finish")
 }

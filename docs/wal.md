@@ -80,6 +80,12 @@ process. The attempted state is not published, and clients receive
 `durability_failure`. Restart performs checksum/tail recovery before accepting
 new commands.
 
+After B5 archives a finished match in SQLite, it calls `Checkpoint` with the
+terminal sequence. The WAL verifies that no newer record exists, truncates the
+file to zero, and rejects further appends for that finished room. SQLite commits
+first, so a crash can leave an extra WAL to replay but can never leave neither
+copy. See `docs/store.md` for the full write-behind protocol.
+
 ## Test gate
 
 From `backend/`:
