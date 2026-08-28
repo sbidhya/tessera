@@ -95,7 +95,33 @@ current one is confirmed passing.
   - Gate: subprocess exits mid-game without cleanup and a fresh manager recovers
     the board/turn/sequence plus duplicate ack ✅; `go test ./...` ✅; `go test
     -race ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
-- [ ] **B5 — Cold tier: SQLite + write-behind**
+- [x] **B5 — Cold tier: SQLite + write-behind** _(PR: b5-sqlite-cold-tier)_
+  - `internal/store` persists **finished** matches to SQLite and maintains
+    per-player stats (`games_played/wins/losses`) transactionally with the
+    history row. `TESSERA_DB_PATH` (default `data/tessera.db`) controls the file.
+  - **Write-behind batching**: `store.Flusher` collects finished match ids via
+    `Enqueue` (called from the transport hub on `StatusFinished`) and flushes
+    every `100ms` or `10` ids in one SQLite transaction. After a successful
+    commit it **checkpoints** the WAL by removing the per-match file, so replay
+    skips already-archived matches. `wal.Store.Checkpoint` + `Exists` added.
+  - **Idempotent**: `INSERT OR IGNORE` + `RowsAffected` check means re-persisting
+    the same finished match (crash replay, retried flush) does not double-count
+    stats. A batch of already-cold ids is a no-op.
+  - **Crash between WAL and SQLite**: the WAL remains the source of truth.
+    Startup replays all WALs, then immediately flushes any finished matches to
+    SQLite; a second flush is idempotent. See `docs/store.md`.
+  - **HTTP**: read-only history and stats are served from the infra layer
+    (`GET /v1/history?limit&offset`, `GET /v1/players/{id}/stats`) over SQLite;
+    live matches remain on `GET /v1/matches` (transport). Layering is preserved:
+    `store` imports `room+wal`, `transport` imports only `room`.
+  - **Persistence**: SQLite uses `journal_mode=WAL`, `foreign_keys=ON`,
+    `busy_timeout=5000`, file `data/tessera.db`, directory `0750`. The store is
+    a single dependency (`github.com/mattn/go-sqlite3` — the justified CGO
+    exception because the stdlib has no SQL driver).
+  - Gate: history+stats land in SQLite, WAL checkpoint removes file ✅;
+    crash between WAL and SQLite recovers and lands on next flush ✅; async batch
+    (Enqueue + ticker) persists within 500 ms ✅; `go test ./...` ✅;
+    `go test -race ./...` ✅; `go vet` + `gofmt` + `go list -deps` layer check ✅.
 - [ ] **B6 — Matchmaking, presence, light auth**
 
 ## Mobile (Flutter)

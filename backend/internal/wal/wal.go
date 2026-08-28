@@ -279,6 +279,54 @@ func (s *Store) repairTail(f *os.File, validBytes int64) error {
 	return nil
 }
 
+// Checkpoint truncates the WAL for roomID after its match has been
+// successfully flushed to the cold tier (SQLite). The per-match file is
+// removed so a later restart does not replay an already-archived match.
+//
+// Checkpoint is idempotent: removing a non-existent file returns nil. It
+// closes any open handle for that room first, so callers do not race with an
+// ongoing Append.
+func (s *Store) Checkpoint(roomID string) error {
+	if !validRoomID(roomID) {
+		return fmt.Errorf("wal: unsafe room id %q", roomID)
+	}
+	path := filepath.Join(s.dir, roomID+".wal")
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	if log := s.files[roomID]; log != nil {
+		log.mu.Lock()
+		_ = log.file.Close()
+		log.closed = true
+		log.mu.Unlock()
+		delete(s.files, roomID)
+	}
+	s.mu.Unlock()
+
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("wal: checkpoint %s: %w", roomID, err)
+	}
+	if s.policy == SyncAlways {
+		if dir, err := os.Open(s.dir); err == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
+	}
+	return nil
+}
+
+// Exists reports whether a WAL file exists for roomID.
+func (s *Store) Exists(roomID string) bool {
+	if !validRoomID(roomID) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(s.dir, roomID+".wal"))
+	return err == nil
+}
+
 // Close releases all open files. It is idempotent.
 func (s *Store) Close() error {
 	s.mu.Lock()

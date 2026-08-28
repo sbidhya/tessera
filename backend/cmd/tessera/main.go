@@ -12,6 +12,7 @@ import (
 
 	"github.com/sbidhya/tessera/backend/internal/config"
 	"github.com/sbidhya/tessera/backend/internal/room"
+	"github.com/sbidhya/tessera/backend/internal/store"
 	"github.com/sbidhya/tessera/backend/internal/transport"
 	"github.com/sbidhya/tessera/backend/internal/wal"
 )
@@ -58,9 +59,33 @@ func run() error {
 		logger.Error("recover rooms", "err", err)
 		return err
 	}
+
+	// Cold tier: SQLite for finished-match history and player stats. It is the
+	// B5 write-behind layer that batches completed games and checkpoints the WAL.
+	cold, err := store.Open(cfg.DBPath)
+	if err != nil {
+		manager.Shutdown()
+		_ = journal.Close()
+		logger.Error("open cold store", "err", err)
+		return err
+	}
+	flusher := store.NewFlusher(cold, journal, manager, logger)
+	flusher.Start()
+	// Recovery flush: a crash between WAL append and SQLite may have left finished
+	// matches only in the WAL. Flush them now so history is complete before we
+	// serve traffic.
+	if err := flusher.Flush(context.Background()); err != nil {
+		logger.Warn("cold store recovery flush failed", "err", err)
+	}
+
 	api := transport.New(manager, logger)
+	api.SetFlushHook(flusher.Enqueue)
 	defer func() {
 		api.Close()
+		flusher.Stop()
+		if err := cold.Close(); err != nil {
+			logger.Error("close cold store", "err", err)
+		}
 		manager.Shutdown()
 		if err := journal.Close(); err != nil {
 			logger.Error("close WAL", "err", err)
@@ -70,7 +95,7 @@ func run() error {
 	start := time.Now()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newRouter(logger, start, time.Now, api.Handler()),
+		Handler:           newRouterWithStore(logger, start, time.Now, api.Handler(), cold),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

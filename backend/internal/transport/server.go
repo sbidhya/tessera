@@ -28,9 +28,12 @@ type Server struct {
 	logger  *slog.Logger
 	handler http.Handler
 
-	mu     sync.Mutex
+	mu sync.Mutex
+
 	hubs   map[string]*matchHub
 	closed bool
+
+	flushHook func(string)
 }
 
 func New(manager *room.Manager, logger *slog.Logger) *Server {
@@ -45,6 +48,17 @@ func New(manager *room.Manager, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /v1/matches/{matchID}/ws", s.serveWebSocket)
 	s.handler = mux
 	return s
+}
+
+// SetFlushHook sets a callback invoked when a match finishes (StatusFinished).
+// The outer persistence layer (B5 Flusher) uses this to enqueue the finished
+// match for async SQLite batching and WAL checkpointing. The hook is optional
+// and is called from the matchHub actor's goroutine, so it should be
+// non-blocking (Enqueue is).
+func (s *Server) SetFlushHook(hook func(string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushHook = hook
 }
 
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -214,7 +228,8 @@ func (s *Server) hubFor(match *room.Room) (*matchHub, error) {
 	if h, ok := s.hubs[match.ID()]; ok {
 		return h, nil
 	}
-	h := newMatchHub(match, s.logger)
+	hook := s.flushHook
+	h := newMatchHubWithHook(match, s.logger, hook)
 	s.hubs[match.ID()] = h
 	return h, nil
 }

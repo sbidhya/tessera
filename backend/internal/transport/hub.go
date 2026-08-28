@@ -97,8 +97,9 @@ type seqOp struct {
 }
 
 type moveOutcome struct {
-	seq uint64
-	err error
+	seq    uint64
+	status string
+	err    error
 }
 
 // matchHub serializes transport-side events for one room. Room methods are
@@ -106,12 +107,13 @@ type moveOutcome struct {
 // connection membership and broadcasts, preventing concurrent socket readers
 // from publishing seq N+1 before seq N.
 type matchHub struct {
-	match  *room.Room
-	logger *slog.Logger
-	ops    chan any
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
+	match   *room.Room
+	logger  *slog.Logger
+	ops     chan any
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	onFlush func(roomID string)
 
 	// Owned only by loop.
 	clients  map[*wsClient]struct{}
@@ -120,12 +122,17 @@ type matchHub struct {
 }
 
 func newMatchHub(match *room.Room, logger *slog.Logger) *matchHub {
+	return newMatchHubWithHook(match, logger, nil)
+}
+
+func newMatchHubWithHook(match *room.Room, logger *slog.Logger, onFlush func(string)) *matchHub {
 	h := &matchHub{
 		match:    match,
 		logger:   logger.With("match", match.ID()),
 		ops:      make(chan any, 64),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		onFlush:  onFlush,
 		clients:  make(map[*wsClient]struct{}),
 		byPlayer: make(map[string]*wsClient),
 	}
@@ -214,11 +221,14 @@ func (h *matchHub) handleMove(client *wsClient, request room.MoveRequest) moveOu
 		if !client.enqueue(message) {
 			client.close()
 		}
-		return moveOutcome{seq: result.Seq}
+		return moveOutcome{seq: result.Seq, status: result.Status.String()}
 	}
 	h.broadcast(message)
 	h.broadcastStates()
-	return moveOutcome{seq: result.Seq}
+	if result.Status == room.StatusFinished && h.onFlush != nil {
+		h.onFlush(h.match.ID())
+	}
+	return moveOutcome{seq: result.Seq, status: result.Status.String()}
 }
 
 func (h *matchHub) broadcast(message Envelope) {

@@ -24,6 +24,9 @@ func TestDefault(t *testing.T) {
 	if cfg.WALDir != "data/wal" || cfg.WALSync != "always" {
 		t.Errorf("WAL defaults = %q/%q, want data/wal/always", cfg.WALDir, cfg.WALSync)
 	}
+	if cfg.DBPath != "data/tessera.db" {
+		t.Errorf("DBPath = %q, want data/tessera.db", cfg.DBPath)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -33,6 +36,7 @@ func TestLoadOverrides(t *testing.T) {
 		"TESSERA_LOG_LEVEL": "debug",
 		"TESSERA_WAL_DIR":   "/tmp/tessera-wal",
 		"TESSERA_WAL_SYNC":  "never",
+		"TESSERA_DB_PATH":   "/tmp/tessera.db",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -48,6 +52,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.WALDir != "/tmp/tessera-wal" || cfg.WALSync != "never" {
 		t.Errorf("WAL config = %q/%q, want /tmp/tessera-wal/never", cfg.WALDir, cfg.WALSync)
+	}
+	if cfg.DBPath != "/tmp/tessera.db" {
+		t.Errorf("DBPath = %q, want /tmp/tessera.db", cfg.DBPath)
 	}
 }
 
