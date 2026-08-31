@@ -12,6 +12,7 @@ import (
 
 	"github.com/sbidhya/tessera/backend/internal/config"
 	"github.com/sbidhya/tessera/backend/internal/room"
+	"github.com/sbidhya/tessera/backend/internal/store"
 	"github.com/sbidhya/tessera/backend/internal/transport"
 	"github.com/sbidhya/tessera/backend/internal/wal"
 )
@@ -51,9 +52,19 @@ func run() error {
 		logger.Error("open WAL", "err", err)
 		return err
 	}
-
-	manager, err := room.NewDurableManager(logger, cfg.NewRand, journal)
+	coldStore, err := store.Open(cfg.DBPath, journal, logger, store.Options{
+		BatchSize:     cfg.StoreBatchSize,
+		FlushInterval: cfg.StoreFlushInterval,
+	})
 	if err != nil {
+		_ = journal.Close()
+		logger.Error("open SQLite store", "err", err)
+		return err
+	}
+
+	manager, err := room.NewPersistentManager(logger, cfg.NewRand, journal, coldStore)
+	if err != nil {
+		_ = coldStore.Close()
 		_ = journal.Close()
 		logger.Error("recover rooms", "err", err)
 		return err
@@ -62,6 +73,9 @@ func run() error {
 	defer func() {
 		api.Close()
 		manager.Shutdown()
+		if err := coldStore.Close(); err != nil {
+			logger.Error("close SQLite store", "err", err)
+		}
 		if err := journal.Close(); err != nil {
 			logger.Error("close WAL", "err", err)
 		}

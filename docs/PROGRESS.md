@@ -95,7 +95,24 @@ current one is confirmed passing.
   - Gate: subprocess exits mid-game without cleanup and a fresh manager recovers
     the board/turn/sequence plus duplicate ack ✅; `go test ./...` ✅; `go test
     -race ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
-- [ ] **B5 — Cold tier: SQLite + write-behind**
+- [x] **B5 — Cold tier: SQLite + write-behind** _(PR: b5-sqlite-write-behind)_
+  - `internal/store` batches finished matches into SQLite transactions using the
+    pure-Go `modernc.org/sqlite` driver. The schema stores match summaries,
+    participants, the accepted event history, and aggregate player stats.
+  - The room layer emits a persistence-neutral terminal projection only after
+    the winning move is durable and published. SQL stays outside the room actor;
+    the write-behind worker flushes by batch size or interval and drains on
+    graceful shutdown.
+  - Exactly-once stats use `matches.id` as the transaction idempotency key. A
+    retry after SQLite commit does not increment wins/losses twice.
+  - WAL checkpointing happens only after the SQLite commit and verifies the
+    archived sequence is the log's final event before truncating it. Recovered
+    finished WALs are automatically queued again, covering crashes anywhere in
+    the write-behind window. See `docs/store.md`.
+  - Gate: history + stats persistence ✅; batch + checkpoint retry/idempotency
+    tests ✅; subprocess crash between terminal WAL and SQLite recovers and then
+    checkpoints ✅; `go test ./...` ✅; `go test -race ./...` ✅; `go vet` +
+    `gofmt` + inward-layer dependency check ✅.
 - [ ] **B6 — Matchmaking, presence, light auth**
 
 ## Mobile (Flutter)

@@ -28,8 +28,9 @@ const (
 )
 
 var (
-	ErrClosed  = errors.New("wal: store is closed")
-	ErrCorrupt = errors.New("wal: corrupt record")
+	ErrClosed       = errors.New("wal: store is closed")
+	ErrCorrupt      = errors.New("wal: corrupt record")
+	ErrCheckpointed = errors.New("wal: match has been checkpointed")
 )
 
 // SyncPolicy controls when an accepted command is forced from the operating
@@ -68,10 +69,11 @@ type Store struct {
 }
 
 type logFile struct {
-	mu     sync.Mutex
-	file   *os.File
-	failed error
-	closed bool
+	mu           sync.Mutex
+	file         *os.File
+	failed       error
+	closed       bool
+	checkpointed bool
 }
 
 // Open creates dir if needed and returns a ready WAL store.
@@ -125,6 +127,9 @@ func (s *Store) Append(event room.Event) error {
 	if log.closed {
 		return ErrClosed
 	}
+	if log.checkpointed {
+		return fmt.Errorf("%w: %s", ErrCheckpointed, event.RoomID)
+	}
 	if log.failed != nil {
 		return fmt.Errorf("wal: room %s unavailable after prior failure: %w", event.RoomID, log.failed)
 	}
@@ -146,7 +151,7 @@ func (s *Store) fileLocked(roomID string) (*logFile, error) {
 		return log, nil
 	}
 	path := filepath.Join(s.dir, roomID+".wal")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open room %s: %w", roomID, err)
 	}
@@ -173,6 +178,71 @@ func (s *Store) fileLocked(roomID string) (*logFile, error) {
 	log := &logFile{file: f}
 	s.files[roomID] = log
 	return log, nil
+}
+
+// Checkpoint truncates a finished match's WAL only after its SQLite archive has
+// committed. throughSeq must be the terminal (and therefore final) event in the
+// file; refusing a suffix prevents accidentally discarding an event that the
+// cold tier has not stored.
+//
+// A zero-length file is an idempotent success. That is important when a process
+// commits SQLite and checkpoints the WAL, then dies before its in-memory queue
+// records completion: recovery may safely ask to checkpoint the same match.
+func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
+	if !validRoomID(roomID) {
+		return fmt.Errorf("wal: unsafe room id %q", roomID)
+	}
+	if throughSeq == 0 {
+		return errors.New("wal: checkpoint sequence must not be zero")
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	log, err := s.fileLocked(roomID)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if log.closed {
+		return ErrClosed
+	}
+	if log.checkpointed {
+		return nil
+	}
+	if log.failed != nil {
+		return fmt.Errorf("wal: room %s unavailable after prior failure: %w", roomID, log.failed)
+	}
+
+	path := filepath.Join(s.dir, roomID+".wal")
+	events, err := s.readFile(path, roomID)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		log.checkpointed = true
+		return nil
+	}
+	last := events[len(events)-1].Seq
+	if last != throughSeq {
+		return fmt.Errorf("wal: checkpoint room %s through %d, final event is %d", roomID, throughSeq, last)
+	}
+
+	if err := log.file.Truncate(0); err != nil {
+		log.failed = fmt.Errorf("wal: truncate checkpoint for room %s: %w", roomID, err)
+		return log.failed
+	}
+	if err := log.file.Sync(); err != nil {
+		log.failed = fmt.Errorf("wal: sync checkpoint for room %s: %w", roomID, err)
+		return log.failed
+	}
+	log.checkpointed = true
+	return nil
 }
 
 // ReadAll returns every complete event, ordered by room filename and then file

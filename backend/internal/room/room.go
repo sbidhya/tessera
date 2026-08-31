@@ -191,6 +191,7 @@ type Room struct {
 	id      string
 	logger  *slog.Logger
 	journal EventJournal
+	archive FinishedMatchSink
 
 	cmds chan command
 	// quit is closed by Close to ask the loop to stop; done is closed by the
@@ -207,6 +208,7 @@ type Room struct {
 	seats   []seat
 	bySeat  map[string]engine.PlayerID
 	applied map[moveKey]MoveResult
+	events  []Event
 }
 
 // New creates a room and starts its goroutine. rng seeds the match (board layout
@@ -299,8 +301,9 @@ func (r *Room) PlayMove(ctx context.Context, req MoveRequest) (MoveResult, error
 	})
 }
 
-// Leave removes a player. Before the match starts this frees the seat; once it
-// is under way the seat is held so the player can reconnect.
+// Leave removes a player. Before the match starts this frees the seat; while it
+// is under way the seat is held so the player can reconnect. Finished matches
+// are immutable, so a post-game disconnect is a no-op.
 func (r *Room) Leave(ctx context.Context, playerID string) error {
 	_, err := call(ctx, r, func(reply chan<- result[struct{}]) command {
 		return leaveCmd{playerID: playerID, reply: reply}
@@ -324,6 +327,12 @@ func (r *Room) join(playerID string) (JoinResult, error) {
 		return JoinResult{}, ErrInvalidPlayerID
 	}
 	if s, ok := r.bySeat[playerID]; ok {
+		// A finished match is immutable. In particular, no new presence event may
+		// appear after its terminal WAL record: the cold tier checkpoints exactly
+		// through that record after committing the archive.
+		if r.status == StatusFinished {
+			return JoinResult{Seat: s, Rejoined: true, Seq: r.seq, Status: r.status}, nil
+		}
 		// Rejoining always returns the same seat. Transitioning from disconnected
 		// to present is observable state, so it advances seq exactly once; another
 		// Join while already present is a true no-op. This distinction lets B3
@@ -443,6 +452,9 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 	// The map is bounded by the number of accepted moves in one match, which is
 	// bounded by the deck; no eviction is needed at this scale.
 	r.applied[key] = res
+	if r.status == StatusFinished && r.archive != nil {
+		r.archive.MatchFinished(r.finishedMatch())
+	}
 	return res, nil
 }
 
@@ -450,6 +462,12 @@ func (r *Room) leave(playerID string) error {
 	s, ok := r.bySeat[playerID]
 	if !ok {
 		return ErrNotSeated
+	}
+	// Connection presence has no meaning once the result is final. Keeping the
+	// terminal move as the last durable event lets the cold tier safely truncate
+	// the entire per-match WAL after archiving it.
+	if r.status == StatusFinished {
+		return nil
 	}
 	if err := r.append(Event{
 		Version:  EventVersion,
@@ -535,15 +553,64 @@ func (r *Room) occupied() int {
 	return n
 }
 
+// finishedMatch builds the cold-tier projection. It is called only by the room
+// goroutine, or during single-threaded recovery before that goroutine starts.
+func (r *Room) finishedMatch() FinishedMatch {
+	players := make([]FinishedPlayer, 0, len(r.seats))
+	for i, seat := range r.seats {
+		if seat.playerID == "" {
+			continue
+		}
+		p := engine.PlayerID(i)
+		players = append(players, FinishedPlayer{
+			ID:        seat.playerID,
+			Seat:      p,
+			Sequences: r.gs.SequencesWon[p],
+			Won:       p == r.gs.Winner,
+		})
+	}
+	return FinishedMatch{
+		RoomID:         r.id,
+		FinishedSeq:    r.seq,
+		NumPlayers:     r.gs.NumPlayers,
+		SequencesToWin: r.gs.SequencesToWin,
+		Winner:         r.gs.Winner,
+		Players:        players,
+		History:        slices.Clone(r.events),
+	}
+}
+
+// replayFinishedPresence accepts B4-era WALs that recorded socket presence
+// changes after the winning move. New B5 rooms freeze at the terminal state so
+// they can be checkpointed, but rejecting already-durable old records would
+// make an otherwise valid upgrade fail at startup.
+func (r *Room) replayFinishedPresence(event Event) error {
+	seatID, ok := r.bySeat[event.PlayerID]
+	if !ok {
+		return ErrNotSeated
+	}
+	switch event.Type {
+	case EventPlayerJoined:
+		r.seats[seatID].present = true
+	case EventPlayerLeft:
+		r.seats[seatID].present = false
+	default:
+		return fmt.Errorf("unexpected finished presence event %s", event.Type)
+	}
+	r.seq = event.Seq
+	r.events = append(r.events, event)
+	return nil
+}
+
 // append makes a state transition durable. A nil journal is the intentionally
 // in-memory mode used by B2 tests and embedders that do not opt into B4.
 func (r *Room) append(event Event) error {
-	if r.journal == nil {
-		return nil
+	if r.journal != nil {
+		if err := r.journal.Append(event); err != nil {
+			return fmt.Errorf("%w: append %s for room %s at seq %d: %w",
+				ErrDurability, event.Type, r.id, event.Seq, err)
+		}
 	}
-	if err := r.journal.Append(event); err != nil {
-		return fmt.Errorf("%w: append %s for room %s at seq %d: %w",
-			ErrDurability, event.Type, r.id, event.Seq, err)
-	}
+	r.events = append(r.events, event)
 	return nil
 }

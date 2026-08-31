@@ -296,3 +296,54 @@ func TestMoveEventJSONRoundTrip(t *testing.T) {
 		t.Errorf("move event round trip = %+v, want %+v", got, event)
 	}
 }
+
+func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, SyncAlways)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for seq := uint64(1); seq <= 4; seq++ {
+		if err := store.Append(testEvent("r_done", seq, "alice")); err != nil {
+			t.Fatalf("Append %d: %v", seq, err)
+		}
+	}
+	if err := store.Checkpoint("r_done", 3); err == nil {
+		t.Fatal("Checkpoint accepted a sequence before the final event")
+	}
+	if err := store.Checkpoint("r_done", 4); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := store.Checkpoint("r_done", 4); err != nil {
+		t.Fatalf("idempotent Checkpoint: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "r_done.wal"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("checkpointed WAL size = %d, want 0", info.Size())
+	}
+	if err := store.Append(testEvent("r_done", 5, "bob")); !errors.Is(err, ErrCheckpointed) {
+		t.Errorf("Append after checkpoint = %v, want ErrCheckpointed", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(dir, SyncAlways)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	events, err := reopened.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("checkpointed events = %+v, want none", events)
+	}
+	if err := reopened.Checkpoint("r_done", 4); err != nil {
+		t.Fatalf("checkpoint zero-length WAL after restart: %v", err)
+	}
+}
