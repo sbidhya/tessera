@@ -113,7 +113,29 @@ current one is confirmed passing.
     tests ✅; subprocess crash between terminal WAL and SQLite recovers and then
     checkpoints ✅; `go test ./...` ✅; `go test -race ./...` ✅; `go vet` +
     `gofmt` + inward-layer dependency check ✅.
-- [ ] **B6 — Matchmaking, presence, light auth**
+- [x] **B6 — Matchmaking, presence, light auth** _(PR: b6-matchmaking-presence-auth)_
+  - `internal/auth`: anonymous `p_` identities + stateless HMAC-SHA256 tokens
+    (`Issue`/`Verify`, constant-time compare). Leaf package, stdlib only.
+    Secret from `TESSERA_AUTH_SECRET`, else a seed-derived dev default (warns);
+    tokens therefore survive restarts and still own their WAL seats.
+  - `internal/match`: actor-model `Matchmaker` (blocking join, FIFO pairing
+    within equal-`sequences_to_win` buckets, both seats joined before release,
+    idempotent re-join attaches, explicit leave → 204, cancel/paired race
+    recovered via a bounded recent-pairing ring, `Close` unblocks waiters) and
+    a refcounted `Presence` tracker (nil-safe, socket lifetime is the signal).
+    Imports `engine` + `room` only.
+  - `internal/transport`: `NewWithDeps` (plain `New` preserves B3 no-auth
+    behavior); `POST /v1/players`, `POST /v1/matchmaking/join|leave`,
+    `GET /v1/matchmaking/status`, `GET /v1/presence[/{player_id}]`; token
+    enforcement on private state, WS upgrade, and match creation; hub
+    presence hooks (replace doesn't flap, shutdown drains).
+  - `cmd/tessera` wires and shuts down the lobby (`api` → `matchmaker` →
+    `manager`); `docs/match.md` + `docs/protocol.md` document the design.
+  - Gate: two anonymous clients matchmake, pair, play a full game over real
+    WebSockets with a mid-game drop, recover via token `GET state`, reconnect
+    with the same identity, and finish; presence asserted throughout ✅;
+    `go test ./...` ✅; `go test -race ./...` ✅; `go vet` + `gofmt` +
+    inward-layer dependency check ✅.
 
 ## Mobile (Flutter)
 

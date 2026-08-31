@@ -9,6 +9,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
@@ -108,10 +109,13 @@ type moveOutcome struct {
 type matchHub struct {
 	match  *room.Room
 	logger *slog.Logger
-	ops    chan any
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
+	// presence tracks live sockets across all hubs. Its methods are nil-safe,
+	// so a server without the B6 presence layer passes nil and pays nothing.
+	presence *match.Presence
+	ops      chan any
+	stop     chan struct{}
+	done     chan struct{}
+	once     sync.Once
 
 	// Owned only by loop.
 	clients  map[*wsClient]struct{}
@@ -119,10 +123,11 @@ type matchHub struct {
 	lastSeq  uint64
 }
 
-func newMatchHub(match *room.Room, logger *slog.Logger) *matchHub {
+func newMatchHub(match *room.Room, logger *slog.Logger, presence *match.Presence) *matchHub {
 	h := &matchHub{
 		match:    match,
 		logger:   logger.With("match", match.ID()),
+		presence: presence,
 		ops:      make(chan any, 64),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -140,6 +145,11 @@ func (h *matchHub) loop() {
 		case <-h.stop:
 			for client := range h.clients {
 				client.close()
+			}
+			// The process is going away; every socket this hub tracked is
+			// dead, so the presence counts must follow them.
+			for playerID := range h.byPlayer {
+				h.presence.Offline(playerID)
 			}
 			return
 		case raw := <-h.ops:
@@ -163,12 +173,19 @@ func (h *matchHub) handleRegister(client *wsClient) error {
 	if err != nil {
 		return err
 	}
+	// A replacement is not a new online player: the id never went offline, so
+	// the presence count must not move. Only a genuinely new connection marks
+	// the player online.
+	_, already := h.byPlayer[client.playerID]
 	if old := h.byPlayer[client.playerID]; old != nil && old != client {
 		delete(h.clients, old)
 		old.close()
 	}
 	h.clients[client] = struct{}{}
 	h.byPlayer[client.playerID] = client
+	if !already {
+		h.presence.Online(client.playerID)
+	}
 	h.lastSeq = join.Seq
 	h.broadcastStates()
 	h.logger.Info("websocket connected", "player", client.playerID, "seq", h.lastSeq)
@@ -181,6 +198,9 @@ func (h *matchHub) handleUnregister(client *wsClient) {
 	}
 	delete(h.byPlayer, client.playerID)
 	delete(h.clients, client)
+	// The socket is dead regardless of what Leave does, so presence goes
+	// offline before the room call, not after it.
+	h.presence.Offline(client.playerID)
 	if err := h.match.Leave(context.Background(), client.playerID); err != nil && !errors.Is(err, room.ErrRoomClosed) {
 		h.logger.Warn("leave after websocket disconnect failed", "player", client.playerID, "err", err)
 		return
@@ -258,6 +278,7 @@ func (h *matchHub) drop(client *wsClient) {
 	delete(h.clients, client)
 	if h.byPlayer[client.playerID] == client {
 		delete(h.byPlayer, client.playerID)
+		h.presence.Offline(client.playerID)
 		if err := h.match.Leave(context.Background(), client.playerID); err != nil && !errors.Is(err, room.ErrRoomClosed) {
 			h.logger.Warn("leave for slow websocket failed", "player", client.playerID, "err", err)
 		}

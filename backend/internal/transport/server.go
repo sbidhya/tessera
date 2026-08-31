@@ -14,19 +14,35 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/sbidhya/tessera/backend/internal/auth"
 	"github.com/sbidhya/tessera/backend/internal/engine"
+	"github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
 const maxRequestBytes = 16 << 10
 
+// Deps carries the optional B6 subsystems. A nil field disables that
+// subsystem: its routes stay registered but answer 503 with a stable code, so
+// the route surface is identical with or without them and clients can tell
+// "not enabled" apart from "not found". A nil Auth additionally preserves the
+// pre-B6 development behavior where any player_id is accepted without a token.
+type Deps struct {
+	Auth       *auth.Authenticator
+	Matchmaker *match.Matchmaker
+	Presence   *match.Presence
+}
+
 // Server owns the B3 HTTP routes and the live WebSocket hubs. The room manager
 // is injected, so transport remains replaceable and persistence can wrap the
 // room layer later without changing the protocol.
 type Server struct {
-	manager *room.Manager
-	logger  *slog.Logger
-	handler http.Handler
+	manager    *room.Manager
+	logger     *slog.Logger
+	handler    http.Handler
+	auth       *auth.Authenticator
+	matchmaker *match.Matchmaker
+	presence   *match.Presence
 
 	mu     sync.Mutex
 	hubs   map[string]*matchHub
@@ -34,15 +50,32 @@ type Server struct {
 }
 
 func New(manager *room.Manager, logger *slog.Logger) *Server {
+	return NewWithDeps(manager, logger, Deps{})
+}
+
+func NewWithDeps(manager *room.Manager, logger *slog.Logger, deps Deps) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{manager: manager, logger: logger, hubs: make(map[string]*matchHub)}
+	s := &Server{
+		manager:    manager,
+		logger:     logger,
+		hubs:       make(map[string]*matchHub),
+		auth:       deps.Auth,
+		matchmaker: deps.Matchmaker,
+		presence:   deps.Presence,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/matches", s.createMatch)
 	mux.HandleFunc("GET /v1/matches", s.listMatches)
 	mux.HandleFunc("GET /v1/matches/{matchID}", s.getState)
 	mux.HandleFunc("GET /v1/matches/{matchID}/ws", s.serveWebSocket)
+	mux.HandleFunc("POST /v1/players", s.createPlayer)
+	mux.HandleFunc("POST /v1/matchmaking/join", s.joinMatchmaking)
+	mux.HandleFunc("POST /v1/matchmaking/leave", s.leaveMatchmaking)
+	mux.HandleFunc("GET /v1/matchmaking/status", s.matchmakingStatus)
+	mux.HandleFunc("GET /v1/presence", s.getPresence)
+	mux.HandleFunc("GET /v1/presence/{playerID}", s.getPlayerPresence)
 	s.handler = mux
 	return s
 }
@@ -74,6 +107,11 @@ func (s *Server) createMatch(w http.ResponseWriter, r *http.Request) {
 	var req createMatchRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	// Identity is checked before intent: a forged or missing credential fails
+	// closed even when the rest of the request is well-formed.
+	if !s.checkAuth(w, req.PlayerID, req.Token) {
 		return
 	}
 	if req.SequencesToWin == 0 {
@@ -119,7 +157,13 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
 		return
 	}
-	snap, err := match.Snapshot(r.Context(), r.URL.Query().Get("player_id"))
+	// A private view (player_id given) requires the matching token; the
+	// spectator view stays open so anyone can watch a public match.
+	playerID := r.URL.Query().Get("player_id")
+	if playerID != "" && !s.checkAuth(w, playerID, r.URL.Query().Get("token")) {
+		return
+	}
+	snap, err := match.Snapshot(r.Context(), playerID)
 	if err != nil {
 		status, code := httpError(err)
 		writeError(w, status, code, err.Error())
@@ -132,6 +176,10 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	playerID := r.URL.Query().Get("player_id")
 	if playerID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_player_id", "player_id is required")
+		return
+	}
+	// Checked before the upgrade so a rejection still carries an HTTP status.
+	if !s.checkAuth(w, playerID, r.URL.Query().Get("token")) {
 		return
 	}
 	match, ok := s.manager.Get(r.PathValue("matchID"))
@@ -214,9 +262,163 @@ func (s *Server) hubFor(match *room.Room) (*matchHub, error) {
 	if h, ok := s.hubs[match.ID()]; ok {
 		return h, nil
 	}
-	h := newMatchHub(match, s.logger)
+	h := newMatchHub(match, s.logger, s.presence)
 	s.hubs[match.ID()] = h
 	return h, nil
+}
+
+// checkAuth verifies the player's token when the identity layer is enabled
+// and writes the rejection otherwise. In legacy mode (nil Auth) it always
+// passes, preserving the pre-B6 behavior where any player_id is accepted.
+func (s *Server) checkAuth(w http.ResponseWriter, playerID, token string) bool {
+	if s.auth == nil {
+		return true
+	}
+	if playerID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_player_id", "player_id is required")
+		return false
+	}
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing_token", "a token is required for this player_id")
+		return false
+	}
+	if err := s.auth.Verify(playerID, token); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid_token", "token does not match player_id")
+		return false
+	}
+	return true
+}
+
+// createPlayer mints a fresh anonymous identity. The request body is ignored:
+// identity needs no parameters, and requiring an empty JSON object would only
+// add a failure mode to the first call every client makes.
+func (s *Server) createPlayer(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth_disabled", "server runs without the identity layer")
+		return
+	}
+	playerID, token := s.auth.Issue()
+	s.logger.Info("player identity issued", "player", playerID)
+	writeJSON(w, http.StatusCreated, createPlayerResponse{PlayerID: playerID, Token: token})
+}
+
+// joinMatchmaking queues the player and blocks until a partner is found. The
+// request context is the queue membership: a client that goes away is
+// dequeued, and should re-queue with backoff. Because the call can stay open
+// for a while, clients should set their own timeout (30s is a sane default)
+// and retry — a retry while still queued attaches to the existing entry.
+func (s *Server) joinMatchmaking(w http.ResponseWriter, r *http.Request) {
+	if s.matchmaker == nil {
+		writeError(w, http.StatusServiceUnavailable, "matchmaking_disabled", "server runs without matchmaking")
+		return
+	}
+	var req joinMatchmakingRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if !s.checkAuth(w, req.PlayerID, req.Token) {
+		return
+	}
+	result, err := s.matchmaker.Join(r.Context(), match.Request{
+		PlayerID:       req.PlayerID,
+		SequencesToWin: req.SequencesToWin,
+	})
+	if err != nil {
+		// A dead request context means the client is gone; there is nobody
+		// left to read an error body.
+		if r.Context().Err() != nil {
+			return
+		}
+		// The player left the queue while this long-poll was open: the wait
+		// ended without a match, which is a normal outcome, not an error.
+		if errors.Is(err, match.ErrLeftQueue) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeMatchmakingError(w, err)
+		return
+	}
+	s.logger.Info("player paired", "player", req.PlayerID, "match", result.MatchID, "seat", result.Seat)
+	writeJSON(w, http.StatusOK, joinMatchmakingResponse{
+		MatchID:  result.MatchID,
+		Seat:     int(result.Seat),
+		PlayerID: req.PlayerID,
+	})
+}
+
+func (s *Server) leaveMatchmaking(w http.ResponseWriter, r *http.Request) {
+	if s.matchmaker == nil {
+		writeError(w, http.StatusServiceUnavailable, "matchmaking_disabled", "server runs without matchmaking")
+		return
+	}
+	var req leaveMatchmakingRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if !s.checkAuth(w, req.PlayerID, req.Token) {
+		return
+	}
+	cancelled, err := s.matchmaker.Cancel(r.Context(), req.PlayerID)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeMatchmakingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, leaveMatchmakingResponse{Cancelled: cancelled})
+}
+
+func (s *Server) matchmakingStatus(w http.ResponseWriter, r *http.Request) {
+	if s.matchmaker == nil {
+		writeError(w, http.StatusServiceUnavailable, "matchmaking_disabled", "server runs without matchmaking")
+		return
+	}
+	waiting, err := s.matchmaker.QueueDepth(r.Context())
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeMatchmakingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, matchmakingStatusResponse{Waiting: waiting})
+}
+
+func (s *Server) getPresence(w http.ResponseWriter, r *http.Request) {
+	if s.presence == nil {
+		writeError(w, http.StatusServiceUnavailable, "presence_disabled", "server runs without presence tracking")
+		return
+	}
+	writeJSON(w, http.StatusOK, presenceResponse{Online: s.presence.Count()})
+}
+
+func (s *Server) getPlayerPresence(w http.ResponseWriter, r *http.Request) {
+	if s.presence == nil {
+		writeError(w, http.StatusServiceUnavailable, "presence_disabled", "server runs without presence tracking")
+		return
+	}
+	playerID := r.PathValue("playerID")
+	if playerID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_player_id", "player_id is required")
+		return
+	}
+	writeJSON(w, http.StatusOK, playerPresenceResponse{PlayerID: playerID, Online: s.presence.IsOnline(playerID)})
+}
+
+func writeMatchmakingError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, match.ErrInvalidSequencesToWin):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_options", err.Error())
+	case errors.Is(err, room.ErrInvalidPlayerID):
+		writeError(w, http.StatusBadRequest, "invalid_player_id", err.Error())
+	case errors.Is(err, match.ErrMatchmakerClosed), errors.Is(err, room.ErrManagerClosed):
+		writeError(w, http.StatusServiceUnavailable, "server_closed", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", "matchmaking failed")
+	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {

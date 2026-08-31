@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"os"
@@ -10,7 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sbidhya/tessera/backend/internal/auth"
 	"github.com/sbidhya/tessera/backend/internal/config"
+	"github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 	"github.com/sbidhya/tessera/backend/internal/store"
 	"github.com/sbidhya/tessera/backend/internal/transport"
@@ -69,9 +72,35 @@ func run() error {
 		logger.Error("recover rooms", "err", err)
 		return err
 	}
-	api := transport.New(manager, logger)
+
+	// B6 lobby: anonymous identities, matchmaking, and presence. The secret
+	// defaults to a seed-derived value so a dev restart keeps every issued
+	// token valid; production must set TESSERA_AUTH_SECRET explicitly.
+	secret := cfg.AuthSecret
+	if secret == "" {
+		secretRand := cfg.NewRand("auth-secret")
+		var raw [32]byte
+		for i := range raw {
+			raw[i] = byte(secretRand.UintN(256))
+		}
+		secret = hex.EncodeToString(raw[:])
+		logger.Warn("TESSERA_AUTH_SECRET not set; using seed-derived dev secret — set a real secret in production")
+	}
+	authenticator := auth.New([]byte(secret), cfg.NewRand("player-ids"))
+	matchmaker := match.NewMatchmaker(logger, manager)
+	presence := match.NewPresence()
+
+	api := transport.NewWithDeps(manager, logger, transport.Deps{
+		Auth:       authenticator,
+		Matchmaker: matchmaker,
+		Presence:   presence,
+	})
 	defer func() {
 		api.Close()
+		// Unblock matchmaking waiters before rooms go away: a waiter released
+		// by Close during Shutdown would otherwise race Manager.Create
+		// against Shutdown and fail confusingly.
+		matchmaker.Close()
 		manager.Shutdown()
 		if err := coldStore.Close(); err != nil {
 			logger.Error("close SQLite store", "err", err)

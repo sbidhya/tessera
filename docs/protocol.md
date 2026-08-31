@@ -16,10 +16,12 @@ state fields for brevity.
 POST /v1/matches
 Content-Type: application/json
 
-{"sequences_to_win": 1}
+{"sequences_to_win": 1, "player_id": "p_...", "token": "p_...."}
 ```
 
 `sequences_to_win` defaults to `2`. B3 is fixed to the v1 scope of two players.
+With the identity layer enabled, `player_id` + `token` are required; without
+it they are accepted but ignored.
 
 ```json
 {
@@ -54,15 +56,17 @@ their own `hand`; an omitted or unknown id gets a spectator view with an empty
 hand. Every view contains public board cells, chips, sequence lines, per-seat
 hand counts, turn, winner, players/presence, and remaining draw count.
 
-Until B6 adds tokens, `player_id` is a development identity rather than
-authentication.
+With the B6 identity layer enabled, `player_id` must be accompanied by its
+`token` (`?player_id=...&token=...` on GET/WebSocket, `{"player_id",
+"token"}` in POST bodies). Without the layer, any `player_id` is accepted as
+before. The spectator view (no `player_id`) never needs a token.
 
 ## WebSocket
 
 Connect with:
 
 ```text
-GET /v1/matches/{match_id}/ws?player_id=alice
+GET /v1/matches/{match_id}/ws?player_id=alice&token=alice-token
 ```
 
 Opening the socket joins the room. Reopening it with the same id restores the
@@ -162,3 +166,68 @@ not be written safely. A durability failure leaves the live state unchanged.
 
 The B3 integration test performs this flow mid-game and then plays through to a
 winner with two actual WebSocket clients.
+
+## B6 — Identity, matchmaking, presence
+
+### Issue an identity
+
+```http
+POST /v1/players
+```
+
+```json
+{"player_id": "p_9f2c…", "token": "p_9f2c….hmac…"}
+```
+
+Anonymous and unguessable. The client keeps both halves; the token is the
+proof. No request body is needed. Answers `503 auth_disabled` when the server
+runs without the identity layer.
+
+### Matchmaking
+
+```http
+POST /v1/matchmaking/join
+Content-Type: application/json
+
+{"player_id": "p_9f2c…", "token": "p_9f2c….hmac…", "sequences_to_win": 1}
+```
+
+The call stays open until a partner with the same `sequences_to_win` is
+found, then both callers receive:
+
+```json
+{"match_id": "r_12ab…", "seat": 0, "player_id": "p_9f2c…"}
+```
+
+Both seats are already joined, so the match is `playing` — open the sockets
+and play. The request context is the queue membership: disconnect and you are
+withdrawn. Set a client-side timeout (≈30s) and retry; a retry while still
+queued attaches to the existing entry. If you left the queue via
+`POST /v1/matchmaking/leave` while the long-poll was open, it ends with
+`204` (no match), and the leave call itself answers `{"cancelled": true}`.
+`GET /v1/matchmaking/status` answers `{"waiting": n}`.
+
+### Presence
+
+```http
+GET /v1/presence
+GET /v1/presence/{player_id}
+```
+
+```json
+{"online": 2}
+{"player_id": "p_9f2c…", "online": true}
+```
+
+Counts live WebSocket connections across all matches. A reconnect that
+replaces a socket does not flap the count; the last disconnect takes the
+player offline.
+
+### Error codes (B6 additions)
+
+`missing_token` / `invalid_token` (401), `auth_disabled`,
+`matchmaking_disabled`, `presence_disabled` (503), `invalid_options` (422 for
+a negative `sequences_to_win`). The B6 integration test pairs two anonymous
+clients through the queue, plays a full game over real WebSockets with a
+mid-game drop, recovers via token-authenticated `GET state`, reconnects with
+the same identity, and finishes — with presence asserting each transition.
