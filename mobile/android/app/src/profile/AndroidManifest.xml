@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The local development backend serves HTTP; release builds still
+         require HTTPS because this override is limited to debug/profile. -->
+    <application android:usesCleartextTraffic="true"/>
+</manifest>

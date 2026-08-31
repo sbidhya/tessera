@@ -139,7 +139,17 @@ current one is confirmed passing.
 
 ## Mobile (Flutter)
 
-- [ ] M1 skeleton → `/healthz` status
+- [x] **M1 — App skeleton + server health** _(PR: m1-mobile-health)_
+  - Flutter app targets iOS and Android and checks the backend's `GET /healthz`
+    endpoint on startup, showing loading, online (status + uptime), and
+    unavailable states with retry.
+  - Emulator-aware defaults use `10.0.2.2:8080` on Android and
+    `127.0.0.1:8080` on iOS; `TESSERA_BACKEND_URL` can be supplied with
+    `--dart-define` for physical devices and other environments.
+  - The health client validates HTTP status and JSON shape. Android/iOS local
+    networking settings permit the development backend's plain HTTP endpoint.
+  - Gate: `flutter analyze` ✅; API + widget tests via `flutter test` ✅;
+    backend `go test -race ./...` ✅.
 - [ ] M2 identity + lobby
 - [ ] M3 board rendering
 - [ ] M4 WebSocket wiring
