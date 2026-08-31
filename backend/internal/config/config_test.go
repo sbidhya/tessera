@@ -40,6 +40,7 @@ func TestLoadOverrides(t *testing.T) {
 		"TESSERA_DB_PATH":              "/tmp/tessera.db",
 		"TESSERA_STORE_BATCH_SIZE":     "8",
 		"TESSERA_STORE_FLUSH_INTERVAL": "250ms",
+		"TESSERA_AUTH_SECRET":          "s3cr3t",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -58,6 +59,22 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.DBPath != "/tmp/tessera.db" || cfg.StoreBatchSize != 8 || cfg.StoreFlushInterval != 250*time.Millisecond {
 		t.Errorf("store config = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
+	}
+	if cfg.AuthSecret != "s3cr3t" {
+		t.Errorf("AuthSecret = %q, want s3cr3t", cfg.AuthSecret)
+	}
+}
+
+func TestLoadAuthSecret(t *testing.T) {
+	if cfg, err := Load(envFunc(nil)); err != nil || cfg.AuthSecret != "" {
+		t.Fatalf("default AuthSecret = %q, %v; want empty (dev default)", cfg.AuthSecret, err)
+	}
+	cfg, err := Load(envFunc(map[string]string{"TESSERA_AUTH_SECRET": "s3cr3t"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthSecret != "s3cr3t" {
+		t.Errorf("AuthSecret = %q, want s3cr3t", cfg.AuthSecret)
 	}
 }
 

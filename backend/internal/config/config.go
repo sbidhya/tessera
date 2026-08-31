@@ -48,6 +48,14 @@ type Config struct {
 	StoreBatchSize int
 	// StoreFlushInterval bounds how long a partial write-behind batch waits.
 	StoreFlushInterval time.Duration
+	// AuthSecret is the HMAC key that signs anonymous identity tokens
+	// (internal/auth). Empty selects the deterministic dev default: a
+	// 32-byte value drawn from the "auth-secret" RNG stream, so the same
+	// Seed keeps issuing verifiable tokens across restarts. Anyone holding
+	// the secret can mint arbitrary identities, so production deployments
+	// MUST set TESSERA_AUTH_SECRET to an unpredictable value; the process
+	// logs a warning when it falls back to the seed-derived default.
+	AuthSecret string
 }
 
 // Default returns the built-in configuration used when no environment
@@ -76,6 +84,7 @@ func Default() Config {
 //	TESSERA_DB_PATH    -> DBPath     (SQLite file path)
 //	TESSERA_STORE_BATCH_SIZE -> StoreBatchSize (positive integer)
 //	TESSERA_STORE_FLUSH_INTERVAL -> StoreFlushInterval (Go duration)
+//	TESSERA_AUTH_SECRET -> AuthSecret (HMAC key for identity tokens; empty = seed-derived dev default)
 //
 // It returns an error rather than silently falling back so a typo in a
 // deployment env var fails loudly instead of running with a surprising value.
@@ -133,6 +142,10 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("config: invalid TESSERA_STORE_FLUSH_INTERVAL %q (want a positive duration)", v)
 		}
 		cfg.StoreFlushInterval = interval
+	}
+
+	if v := getenv("TESSERA_AUTH_SECRET"); v != "" {
+		cfg.AuthSecret = v
 	}
 
 	return cfg, nil

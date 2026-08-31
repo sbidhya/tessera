@@ -106,6 +106,54 @@ type MatchSummary struct {
 
 type createMatchRequest struct {
 	SequencesToWin int `json:"sequences_to_win"`
+	// PlayerID and Token authenticate the request when the server runs with
+	// the B6 identity layer. They are ignored in legacy (no-auth) mode, so
+	// one wire shape serves both.
+	PlayerID string `json:"player_id"`
+	Token    string `json:"token"`
+}
+
+// createPlayerResponse is the anonymous identity issued by POST /v1/players.
+// The client must keep both halves: the id names the player, the token proves
+// it. Losing the token means losing the identity — there is no recovery, by
+// design (no accounts, no personal data).
+type createPlayerResponse struct {
+	PlayerID string `json:"player_id"`
+	Token    string `json:"token"`
+}
+
+type joinMatchmakingRequest struct {
+	PlayerID       string `json:"player_id"`
+	Token          string `json:"token"`
+	SequencesToWin int    `json:"sequences_to_win"`
+}
+
+type joinMatchmakingResponse struct {
+	MatchID  string `json:"match_id"`
+	Seat     int    `json:"seat"`
+	PlayerID string `json:"player_id"`
+}
+
+type leaveMatchmakingRequest struct {
+	PlayerID string `json:"player_id"`
+	Token    string `json:"token"`
+}
+
+type leaveMatchmakingResponse struct {
+	Cancelled bool `json:"cancelled"`
+}
+
+type matchmakingStatusResponse struct {
+	Waiting int `json:"waiting"`
+}
+
+type presenceResponse struct {
+	Online int `json:"online"`
+}
+
+type playerPresenceResponse struct {
+	PlayerID string `json:"player_id"`
+	Online   bool   `json:"online"`
 }
 
 type createMatchResponse struct {
