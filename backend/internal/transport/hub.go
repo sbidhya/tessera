@@ -9,6 +9,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
@@ -107,6 +108,7 @@ type moveOutcome struct {
 // from publishing seq N+1 before seq N.
 type matchHub struct {
 	match  *room.Room
+	lobby  *matchmaking.Service
 	logger *slog.Logger
 	ops    chan any
 	stop   chan struct{}
@@ -119,9 +121,10 @@ type matchHub struct {
 	lastSeq  uint64
 }
 
-func newMatchHub(match *room.Room, logger *slog.Logger) *matchHub {
+func newMatchHub(match *room.Room, lobby *matchmaking.Service, logger *slog.Logger) *matchHub {
 	h := &matchHub{
 		match:    match,
+		lobby:    lobby,
 		logger:   logger.With("match", match.ID()),
 		ops:      make(chan any, 64),
 		stop:     make(chan struct{}),
@@ -139,6 +142,8 @@ func (h *matchHub) loop() {
 		select {
 		case <-h.stop:
 			for client := range h.clients {
+				_ = h.match.Leave(context.Background(), client.playerID)
+				h.lobby.Disconnected(client.playerID)
 				client.close()
 			}
 			return
@@ -165,10 +170,12 @@ func (h *matchHub) handleRegister(client *wsClient) error {
 	}
 	if old := h.byPlayer[client.playerID]; old != nil && old != client {
 		delete(h.clients, old)
+		h.lobby.Disconnected(old.playerID)
 		old.close()
 	}
 	h.clients[client] = struct{}{}
 	h.byPlayer[client.playerID] = client
+	h.lobby.Connected(client.playerID)
 	h.lastSeq = join.Seq
 	h.broadcastStates()
 	h.logger.Info("websocket connected", "player", client.playerID, "seq", h.lastSeq)
@@ -181,6 +188,7 @@ func (h *matchHub) handleUnregister(client *wsClient) {
 	}
 	delete(h.byPlayer, client.playerID)
 	delete(h.clients, client)
+	h.lobby.Disconnected(client.playerID)
 	if err := h.match.Leave(context.Background(), client.playerID); err != nil && !errors.Is(err, room.ErrRoomClosed) {
 		h.logger.Warn("leave after websocket disconnect failed", "player", client.playerID, "err", err)
 		return
@@ -258,6 +266,7 @@ func (h *matchHub) drop(client *wsClient) {
 	delete(h.clients, client)
 	if h.byPlayer[client.playerID] == client {
 		delete(h.byPlayer, client.playerID)
+		h.lobby.Disconnected(client.playerID)
 		if err := h.match.Leave(context.Background(), client.playerID); err != nil && !errors.Is(err, room.ErrRoomClosed) {
 			h.logger.Warn("leave for slow websocket failed", "player", client.playerID, "err", err)
 		}

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/config"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 	"github.com/sbidhya/tessera/backend/internal/store"
 	"github.com/sbidhya/tessera/backend/internal/transport"
@@ -69,7 +71,18 @@ func run() error {
 		logger.Error("recover rooms", "err", err)
 		return err
 	}
-	api := transport.New(manager, logger)
+	lobby, err := matchmaking.NewService(manager, logger, cfg.AuthSecret, rand.Reader)
+	if err != nil {
+		manager.Shutdown()
+		_ = coldStore.Close()
+		_ = journal.Close()
+		logger.Error("configure matchmaking", "err", err)
+		return err
+	}
+	if cfg.AuthSecret == config.Default().AuthSecret {
+		logger.Warn("using development auth secret; set TESSERA_AUTH_SECRET outside local development")
+	}
+	api := transport.New(manager, lobby, logger)
 	defer func() {
 		api.Close()
 		manager.Shutdown()

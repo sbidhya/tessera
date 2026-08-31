@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/sbidhya/tessera/backend/internal/engine"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
@@ -104,6 +105,27 @@ type MatchSummary struct {
 	SequencesToWin int    `json:"sequences_to_win"`
 }
 
+type identityResponse struct {
+	PlayerID string `json:"player_id"`
+	Token    string `json:"token"`
+}
+
+type matchmakingRequest struct {
+	SequencesToWin int `json:"sequences_to_win"`
+}
+
+type matchmakingResponse struct {
+	Status         string `json:"status"`
+	MatchID        string `json:"match_id,omitempty"`
+	Position       int    `json:"position,omitempty"`
+	SequencesToWin int    `json:"sequences_to_win,omitempty"`
+}
+
+type presenceResponse struct {
+	PlayerID string `json:"player_id"`
+	Online   bool   `json:"online"`
+}
+
 type createMatchRequest struct {
 	SequencesToWin int `json:"sequences_to_win"`
 }
@@ -144,6 +166,15 @@ type errorPayload struct {
 
 type errorResponse struct {
 	Error errorPayload `json:"error"`
+}
+
+func matchmakingResponseFromStatus(status matchmaking.QueueStatus) matchmakingResponse {
+	return matchmakingResponse{
+		Status:         string(status.State),
+		MatchID:        status.MatchID,
+		Position:       status.Position,
+		SequencesToWin: status.SequencesToWin,
+	}
 }
 
 func stateFromSnapshot(s room.Snapshot) State {

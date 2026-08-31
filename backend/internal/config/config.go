@@ -48,6 +48,9 @@ type Config struct {
 	StoreBatchSize int
 	// StoreFlushInterval bounds how long a partial write-behind batch waits.
 	StoreFlushInterval time.Duration
+	// AuthSecret signs anonymous-player bearer tokens. Deployments must override
+	// the development default so identities cannot be forged.
+	AuthSecret string
 }
 
 // Default returns the built-in configuration used when no environment
@@ -62,6 +65,7 @@ func Default() Config {
 		DBPath:             "data/tessera.db",
 		StoreBatchSize:     16,
 		StoreFlushInterval: time.Second,
+		AuthSecret:         "development-only-change-me",
 	}
 }
 
@@ -76,6 +80,7 @@ func Default() Config {
 //	TESSERA_DB_PATH    -> DBPath     (SQLite file path)
 //	TESSERA_STORE_BATCH_SIZE -> StoreBatchSize (positive integer)
 //	TESSERA_STORE_FLUSH_INTERVAL -> StoreFlushInterval (Go duration)
+//	TESSERA_AUTH_SECRET -> AuthSecret (non-empty string)
 //
 // It returns an error rather than silently falling back so a typo in a
 // deployment env var fails loudly instead of running with a surprising value.
@@ -133,6 +138,10 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("config: invalid TESSERA_STORE_FLUSH_INTERVAL %q (want a positive duration)", v)
 		}
 		cfg.StoreFlushInterval = interval
+	}
+
+	if v := getenv("TESSERA_AUTH_SECRET"); v != "" {
+		cfg.AuthSecret = v
 	}
 
 	return cfg, nil

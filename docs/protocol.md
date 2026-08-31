@@ -1,4 +1,4 @@
-# B3 — HTTP and WebSocket protocol
+# B3/B6 — HTTP, WebSocket, identity, and matchmaking protocol
 
 The server is authoritative: clients send an intended move, and only the room
 actor decides whether it applies. Transport never edits game state. Accepted
@@ -10,10 +10,49 @@ state fields for brevity.
 
 ## REST
 
+### Create an anonymous identity
+
+```http
+POST /v1/auth/anonymous
+```
+
+```json
+{"player_id":"p_...","token":"v1.p_....signature"}
+```
+
+The token is an HMAC-signed bearer credential. Store both values on the device,
+but send only `Authorization: Bearer <token>` on authenticated requests. The
+server derives `player_id` from the verified token and never trusts a caller-
+supplied id for private state or moves. Tokens have no expiry or revocation in
+this lightweight version; keeping `TESSERA_AUTH_SECRET` stable preserves them
+across process restarts.
+
+### Matchmaking
+
+Join the FIFO queue (players are matched only with the same win condition):
+
+```http
+POST /v1/matchmaking
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"sequences_to_win":1}
+```
+
+The response is initially `{"status":"queued","position":1,...}`. When a
+second compatible player joins, both players' `GET /v1/matchmaking` responses
+become `{"status":"matched","match_id":"r_...",...}`. Calling
+`DELETE /v1/matchmaking` cancels a queued request. A matched player keeps the
+same room assignment for the lifetime of this process.
+
+`GET /v1/presence/{player_id}` requires any valid bearer token and returns
+whether that player currently has at least one live game WebSocket.
+
 ### Create a match
 
 ```http
 POST /v1/matches
+Authorization: Bearer <token>
 Content-Type: application/json
 
 {"sequences_to_win": 1}
@@ -46,27 +85,28 @@ Returns `{"matches": [...]}` with the same summary shape as create.
 ### Get authoritative state
 
 ```http
-GET /v1/matches/{match_id}?player_id=alice
+GET /v1/matches/{match_id}
+Authorization: Bearer <token>
 ```
 
-The optional `player_id` selects a private view. A seated player receives only
-their own `hand`; an omitted or unknown id gets a spectator view with an empty
-hand. Every view contains public board cells, chips, sequence lines, per-seat
-hand counts, turn, winner, players/presence, and remaining draw count.
-
-Until B6 adds tokens, `player_id` is a development identity rather than
-authentication.
+The verified bearer identity selects the private view. A seated player receives
+only their own `hand`; omitting Authorization produces a spectator view with an
+empty hand. Query-string player ids are ignored. Every view contains public
+board cells, chips, sequence lines, per-seat hand counts, turn, winner,
+players/presence, and remaining draw count.
 
 ## WebSocket
 
 Connect with:
 
 ```text
-GET /v1/matches/{match_id}/ws?player_id=alice
+GET /v1/matches/{match_id}/ws
+Authorization: Bearer <token>
 ```
 
-Opening the socket joins the room. Reopening it with the same id restores the
-same seat. A newer socket for the same player replaces the old one.
+Opening the socket joins the room as the authenticated player. Reopening it
+with the same token restores the same seat. A newer socket for the same player
+replaces the old one.
 
 Every message uses one envelope:
 
@@ -154,9 +194,9 @@ not be written safely. A durability failure leaves the live state unchanged.
 ## Reconnect flow
 
 1. A dropped socket marks its held seat absent and advances `seq`.
-2. The client calls `GET state?player_id=...` to recover the authoritative board,
-   private hand, and latest `seq`.
-3. It opens the WebSocket again with the same `player_id`; the room restores the
+2. The client calls authenticated `GET state` to recover the authoritative
+   board, private hand, and latest `seq`.
+3. It opens the WebSocket again with the same bearer token; the room restores the
    same seat, marks it present, and broadcasts the new state.
 4. The next move uses the recovered/broadcast `seq`.
 

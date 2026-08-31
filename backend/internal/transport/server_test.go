@@ -3,13 +3,13 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -18,11 +18,13 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/sbidhya/tessera/backend/internal/config"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
 type testBackend struct {
 	api     *Server
+	lobby   *matchmaking.Service
 	manager *room.Manager
 	http    *httptest.Server
 }
@@ -32,9 +34,13 @@ func newTestBackend(t *testing.T, seed int64) *testBackend {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := config.Config{Seed: seed}
 	manager := room.NewManager(logger, cfg.NewRand)
-	api := New(manager, logger)
+	lobby, err := matchmaking.NewService(manager, logger, "transport-test-secret", rand.Reader)
+	if err != nil {
+		t.Fatalf("new matchmaking service: %v", err)
+	}
+	api := New(manager, lobby, logger)
 	server := httptest.NewServer(api.Handler())
-	b := &testBackend{api: api, manager: manager, http: server}
+	b := &testBackend{api: api, lobby: lobby, manager: manager, http: server}
 	t.Cleanup(func() {
 		server.Close()
 		api.Close()
@@ -56,7 +62,8 @@ func TestDurabilityFailureMapsToServiceUnavailable(t *testing.T) {
 
 func TestRESTCreateListAndGetState(t *testing.T) {
 	b := newTestBackend(t, 1)
-	created := createMatch(t, b.http.URL, 1)
+	identity := createIdentity(t, b.http.URL)
+	created := createMatch(t, b.http.URL, identity.Token, 1)
 	if created.Match.Status != "waiting" || created.Match.Capacity != 2 {
 		t.Fatalf("created match = %+v", created.Match)
 	}
@@ -98,26 +105,21 @@ func TestRESTCreateListAndGetState(t *testing.T) {
 
 func TestRESTValidationAndNotFound(t *testing.T) {
 	b := newTestBackend(t, 1)
+	identity := createIdentity(t, b.http.URL)
 
-	resp, err := http.Post(b.http.URL+"/v1/matches", "application/json", strings.NewReader(`{"unknown":1}`))
-	if err != nil {
-		t.Fatalf("POST invalid match: %v", err)
-	}
+	resp := authenticatedJSONRequest(t, http.MethodPost, b.http.URL+"/v1/matches", identity.Token, strings.NewReader(`{"unknown":1}`))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("invalid JSON status = %d, want 400", resp.StatusCode)
 	}
 
-	resp, err = http.Post(b.http.URL+"/v1/matches", "application/json", strings.NewReader(`{"sequences_to_win":-1}`))
-	if err != nil {
-		t.Fatalf("POST invalid options: %v", err)
-	}
+	resp = authenticatedJSONRequest(t, http.MethodPost, b.http.URL+"/v1/matches", identity.Token, strings.NewReader(`{"sequences_to_win":-1}`))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Errorf("invalid options status = %d, want 422", resp.StatusCode)
 	}
 
-	resp, err = http.Get(b.http.URL + "/v1/matches/r_missing")
+	resp, err := http.Get(b.http.URL + "/v1/matches/r_missing")
 	if err != nil {
 		t.Fatalf("GET missing match: %v", err)
 	}
@@ -127,23 +129,94 @@ func TestRESTValidationAndNotFound(t *testing.T) {
 	}
 }
 
-// TestWebSocketFullGameReconnect is the B3 integration gate. Two real
-// WebSocket clients join through the HTTP server, play a complete game from
-// their private state messages, retry one move idempotently, lose a socket,
-// recover through GET state, reconnect, and finish the match.
+func TestAuthRejectsMissingAndTamperedTokens(t *testing.T) {
+	b := newTestBackend(t, 1)
+
+	resp, err := http.Post(b.http.URL+"/v1/matches", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST unauthenticated match: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("missing token status = %d, want 401", resp.StatusCode)
+	}
+
+	identity := createIdentity(t, b.http.URL)
+	resp = authenticatedJSONRequest(t, http.MethodPost, b.http.URL+"/v1/matchmaking", identity.Token+"x", strings.NewReader(`{}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("tampered token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestMatchmakingCanBeCancelled(t *testing.T) {
+	b := newTestBackend(t, 1)
+	identity := createIdentity(t, b.http.URL)
+	queued := joinMatchmaking(t, b.http.URL, identity.Token, 2)
+	if queued.Status != "queued" {
+		t.Fatalf("initial matchmaking = %+v", queued)
+	}
+	resp := authenticatedRequest(t, http.MethodDelete, b.http.URL+"/v1/matchmaking", identity.Token, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("DELETE matchmaking status = %d: %s", resp.StatusCode, data)
+	}
+	var cancelled matchmakingResponse
+	decodeResponse(t, resp, &cancelled)
+	if cancelled.Status != "idle" {
+		t.Fatalf("cancelled matchmaking = %+v", cancelled)
+	}
+}
+
+// TestWebSocketFullGameReconnect is the B6 integration gate. Two authenticated
+// clients matchmake, play a complete game from their private state messages,
+// retry one move idempotently, lose a socket, recover through GET state,
+// reconnect, and finish the match.
 func TestWebSocketFullGameReconnect(t *testing.T) {
 	b := newTestBackend(t, 7)
-	matchID := createMatch(t, b.http.URL, 1).Match.ID
+	aliceIdentity := createIdentity(t, b.http.URL)
+	bobIdentity := createIdentity(t, b.http.URL)
+	aliceQueued := joinMatchmaking(t, b.http.URL, aliceIdentity.Token, 1)
+	if aliceQueued.Status != "queued" || aliceQueued.Position != 1 {
+		t.Fatalf("alice matchmaking = %+v, want queued first", aliceQueued)
+	}
+	bobMatched := joinMatchmaking(t, b.http.URL, bobIdentity.Token, 1)
+	if bobMatched.Status != "matched" || bobMatched.MatchID == "" {
+		t.Fatalf("bob matchmaking = %+v, want matched", bobMatched)
+	}
+	aliceMatched := getMatchmaking(t, b.http.URL, aliceIdentity.Token)
+	if aliceMatched.Status != "matched" || aliceMatched.MatchID != bobMatched.MatchID {
+		t.Fatalf("alice matchmaking = %+v, bob = %+v", aliceMatched, bobMatched)
+	}
+	matchID := bobMatched.MatchID
 
-	alice := dialPlayer(t, b.http.URL, matchID, "alice")
-	bob := dialPlayer(t, b.http.URL, matchID, "bob")
+	alice := dialPlayer(t, b.http.URL, matchID, aliceIdentity.Token)
+	bob := dialPlayer(t, b.http.URL, matchID, bobIdentity.Token)
 	defer alice.CloseNow()
 	defer bob.CloseNow()
 
-	aliceState := readStateAtLeast(t, alice, 3)
-	bobState := readStateAtLeast(t, bob, 3)
+	bobState := readStateAtLeast(t, bob, 1)
+	aliceState := readStateAtLeast(t, alice, bobState.seq)
 	assertPrivateState(t, aliceState.state, 0)
 	assertPrivateState(t, bobState.state, 1)
+	if !getPresence(t, b.http.URL, bobIdentity.Token, aliceIdentity.PlayerID).Online {
+		t.Fatal("alice should be online after websocket connect")
+	}
+	resp, err := http.Get(b.http.URL + "/v1/matches/" + matchID + "?player_id=" + aliceIdentity.PlayerID)
+	if err != nil {
+		t.Fatalf("GET spoofed player state: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("GET spoofed player state status = %d", resp.StatusCode)
+	}
+	var spoofed stateResponse
+	decodeResponse(t, resp, &spoofed)
+	resp.Body.Close()
+	if spoofed.State.Viewer != nil || len(spoofed.State.Hand) != 0 {
+		t.Fatal("query-string player id exposed private state without a bearer token")
+	}
 
 	clients := map[int]*websocket.Conn{0: alice, 1: bob}
 	states := map[int]observedState{0: aliceState, 1: bobState}
@@ -202,20 +275,23 @@ func TestWebSocketFullGameReconnect(t *testing.T) {
 
 			bobAfterDrop := readStateAtLeast(t, bob, beforeDrop.seq+1)
 			states[1] = bobAfterDrop
-			recovered := getPlayerState(t, b.http.URL, matchID, "alice")
+			recovered := getPlayerState(t, b.http.URL, matchID, aliceIdentity.Token)
 			if recovered.Seq != bobAfterDrop.seq {
 				t.Fatalf("GET recovery seq = %d, broadcast seq = %d", recovered.Seq, bobAfterDrop.seq)
 			}
-			if len(recovered.State.Hand) == 0 || playerPresent(recovered.State, "alice") {
+			if len(recovered.State.Hand) == 0 || playerPresent(recovered.State, aliceIdentity.PlayerID) {
 				t.Fatalf("recovered alice state missing hand or still present: %+v", recovered.State.Players)
 			}
+			if getPresence(t, b.http.URL, bobIdentity.Token, aliceIdentity.PlayerID).Online {
+				t.Fatal("alice should be offline after websocket disconnect")
+			}
 
-			alice = dialPlayer(t, b.http.URL, matchID, "alice")
+			alice = dialPlayer(t, b.http.URL, matchID, aliceIdentity.Token)
 			defer alice.CloseNow()
 			clients[0] = alice
 			states[0] = readStateAtLeast(t, alice, recovered.Seq+1)
 			states[1] = readStateAtLeast(t, bob, recovered.Seq+1)
-			if !playerPresent(states[0].state, "alice") {
+			if !playerPresent(states[0].state, aliceIdentity.PlayerID) {
 				t.Fatal("alice was not marked present after reconnect")
 			}
 			reconnected = true
@@ -249,16 +325,35 @@ type observedError struct {
 	errorPayload
 }
 
-func createMatch(t *testing.T, baseURL string, sequencesToWin int) createMatchResponse {
+func createIdentity(t *testing.T, baseURL string) identityResponse {
+	t.Helper()
+	resp, err := http.Post(baseURL+"/v1/auth/anonymous", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST anonymous auth: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST anonymous auth status = %d: %s", resp.StatusCode, data)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous auth Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
+	}
+	var identity identityResponse
+	decodeResponse(t, resp, &identity)
+	if identity.PlayerID == "" || identity.Token == "" {
+		t.Fatalf("incomplete identity: %+v", identity)
+	}
+	return identity
+}
+
+func createMatch(t *testing.T, baseURL, token string, sequencesToWin int) createMatchResponse {
 	t.Helper()
 	body, err := json.Marshal(createMatchRequest{SequencesToWin: sequencesToWin})
 	if err != nil {
 		t.Fatalf("marshal create request: %v", err)
 	}
-	resp, err := http.Post(baseURL+"/v1/matches", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST match: %v", err)
-	}
+	resp := authenticatedJSONRequest(t, http.MethodPost, baseURL+"/v1/matches", token, bytes.NewReader(body))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		data, _ := io.ReadAll(resp.Body)
@@ -269,13 +364,52 @@ func createMatch(t *testing.T, baseURL string, sequencesToWin int) createMatchRe
 	return created
 }
 
-func getPlayerState(t *testing.T, baseURL, matchID, playerID string) stateResponse {
+func joinMatchmaking(t *testing.T, baseURL, token string, sequencesToWin int) matchmakingResponse {
 	t.Helper()
-	u := baseURL + "/v1/matches/" + matchID + "?player_id=" + url.QueryEscape(playerID)
-	resp, err := http.Get(u)
+	body, err := json.Marshal(matchmakingRequest{SequencesToWin: sequencesToWin})
 	if err != nil {
-		t.Fatalf("GET player state: %v", err)
+		t.Fatalf("marshal matchmaking request: %v", err)
 	}
+	resp := authenticatedJSONRequest(t, http.MethodPost, baseURL+"/v1/matchmaking", token, bytes.NewReader(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST matchmaking status = %d: %s", resp.StatusCode, data)
+	}
+	var status matchmakingResponse
+	decodeResponse(t, resp, &status)
+	return status
+}
+
+func getMatchmaking(t *testing.T, baseURL, token string) matchmakingResponse {
+	t.Helper()
+	resp := authenticatedRequest(t, http.MethodGet, baseURL+"/v1/matchmaking", token, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET matchmaking status = %d: %s", resp.StatusCode, data)
+	}
+	var status matchmakingResponse
+	decodeResponse(t, resp, &status)
+	return status
+}
+
+func getPresence(t *testing.T, baseURL, token, playerID string) presenceResponse {
+	t.Helper()
+	resp := authenticatedRequest(t, http.MethodGet, baseURL+"/v1/presence/"+playerID, token, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET presence status = %d: %s", resp.StatusCode, data)
+	}
+	var presence presenceResponse
+	decodeResponse(t, resp, &presence)
+	return presence
+}
+
+func getPlayerState(t *testing.T, baseURL, matchID, token string) stateResponse {
+	t.Helper()
+	resp := authenticatedRequest(t, http.MethodGet, baseURL+"/v1/matches/"+matchID, token, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET player state status = %d", resp.StatusCode)
@@ -292,21 +426,44 @@ func decodeResponse(t *testing.T, resp *http.Response, dst any) {
 	}
 }
 
-func dialPlayer(t *testing.T, baseURL, matchID, playerID string) *websocket.Conn {
+func dialPlayer(t *testing.T, baseURL, matchID, token string) *websocket.Conn {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/v1/matches/" + matchID +
-		"/ws?player_id=" + url.QueryEscape(playerID)
+	wsURL := "ws" + strings.TrimPrefix(baseURL, "http") + "/v1/matches/" + matchID + "/ws"
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": []string{"Bearer " + token},
+	}})
 	if err != nil {
 		if resp != nil {
 			data, _ := io.ReadAll(resp.Body)
-			t.Fatalf("dial %s: %v: %s", playerID, err, data)
+			t.Fatalf("dial websocket: %v: %s", err, data)
 		}
-		t.Fatalf("dial %s: %v", playerID, err)
+		t.Fatalf("dial websocket: %v", err)
 	}
 	return conn
+}
+
+func authenticatedJSONRequest(t *testing.T, method, requestURL, token string, body io.Reader) *http.Response {
+	t.Helper()
+	return authenticatedRequest(t, method, requestURL, token, body, "application/json")
+}
+
+func authenticatedRequest(t *testing.T, method, requestURL, token string, body io.Reader, contentType ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, requestURL, body)
+	if err != nil {
+		t.Fatalf("build %s request: %v", method, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if len(contentType) > 0 {
+		req.Header.Set("Content-Type", contentType[0])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, requestURL, err)
+	}
+	return resp
 }
 
 func writeMessage(t *testing.T, conn *websocket.Conn, message Envelope) {

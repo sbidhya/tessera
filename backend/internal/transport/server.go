@@ -9,12 +9,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/sbidhya/tessera/backend/internal/engine"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 )
 
@@ -25,6 +27,7 @@ const maxRequestBytes = 16 << 10
 // room layer later without changing the protocol.
 type Server struct {
 	manager *room.Manager
+	lobby   *matchmaking.Service
 	logger  *slog.Logger
 	handler http.Handler
 
@@ -33,18 +36,82 @@ type Server struct {
 	closed bool
 }
 
-func New(manager *room.Manager, logger *slog.Logger) *Server {
+func New(manager *room.Manager, lobby *matchmaking.Service, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{manager: manager, logger: logger, hubs: make(map[string]*matchHub)}
+	s := &Server{manager: manager, lobby: lobby, logger: logger, hubs: make(map[string]*matchHub)}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/auth/anonymous", s.createIdentity)
+	mux.HandleFunc("POST /v1/matchmaking", s.joinMatchmaking)
+	mux.HandleFunc("GET /v1/matchmaking", s.getMatchmaking)
+	mux.HandleFunc("DELETE /v1/matchmaking", s.leaveMatchmaking)
+	mux.HandleFunc("GET /v1/presence/{playerID}", s.getPresence)
 	mux.HandleFunc("POST /v1/matches", s.createMatch)
 	mux.HandleFunc("GET /v1/matches", s.listMatches)
 	mux.HandleFunc("GET /v1/matches/{matchID}", s.getState)
 	mux.HandleFunc("GET /v1/matches/{matchID}/ws", s.serveWebSocket)
 	s.handler = mux
 	return s
+}
+
+func (s *Server) createIdentity(w http.ResponseWriter, _ *http.Request) {
+	identity, err := s.lobby.IssueIdentity()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "identity_failure", "could not create identity")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, identityResponse{PlayerID: identity.PlayerID, Token: identity.Token})
+}
+
+func (s *Server) joinMatchmaking(w http.ResponseWriter, r *http.Request) {
+	playerID, ok := s.requirePlayer(w, r)
+	if !ok {
+		return
+	}
+	var req matchmakingRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	status, err := s.lobby.Enqueue(playerID, req.SequencesToWin)
+	if err != nil {
+		statusCode, code := lobbyHTTPError(err)
+		writeError(w, statusCode, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, matchmakingResponseFromStatus(status))
+}
+
+func (s *Server) getMatchmaking(w http.ResponseWriter, r *http.Request) {
+	playerID, ok := s.requirePlayer(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, matchmakingResponseFromStatus(s.lobby.QueueStatus(playerID)))
+}
+
+func (s *Server) leaveMatchmaking(w http.ResponseWriter, r *http.Request) {
+	playerID, ok := s.requirePlayer(w, r)
+	if !ok {
+		return
+	}
+	status, err := s.lobby.CancelQueue(playerID)
+	if err != nil {
+		statusCode, code := lobbyHTTPError(err)
+		writeError(w, statusCode, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, matchmakingResponseFromStatus(status))
+}
+
+func (s *Server) getPresence(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requirePlayer(w, r); !ok {
+		return
+	}
+	presence := s.lobby.Presence(r.PathValue("playerID"))
+	writeJSON(w, http.StatusOK, presenceResponse{PlayerID: presence.PlayerID, Online: presence.Online})
 }
 
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -71,6 +138,9 @@ func (s *Server) Close() {
 }
 
 func (s *Server) createMatch(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requirePlayer(w, r); !ok {
+		return
+	}
 	var req createMatchRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
@@ -114,12 +184,16 @@ func (s *Server) listMatches(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
+	playerID, ok := s.optionalPlayer(w, r)
+	if !ok {
+		return
+	}
 	match, ok := s.manager.Get(r.PathValue("matchID"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
 		return
 	}
-	snap, err := match.Snapshot(r.Context(), r.URL.Query().Get("player_id"))
+	snap, err := match.Snapshot(r.Context(), playerID)
 	if err != nil {
 		status, code := httpError(err)
 		writeError(w, status, code, err.Error())
@@ -129,9 +203,8 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
-	playerID := r.URL.Query().Get("player_id")
-	if playerID == "" {
-		writeError(w, http.StatusBadRequest, "invalid_player_id", "player_id is required")
+	playerID, authenticated := s.requirePlayer(w, r)
+	if !authenticated {
 		return
 	}
 	match, ok := s.manager.Get(r.PathValue("matchID"))
@@ -214,9 +287,38 @@ func (s *Server) hubFor(match *room.Room) (*matchHub, error) {
 	if h, ok := s.hubs[match.ID()]; ok {
 		return h, nil
 	}
-	h := newMatchHub(match, s.logger)
+	h := newMatchHub(match, s.lobby, s.logger)
 	s.hubs[match.ID()] = h
 	return h, nil
+}
+
+func (s *Server) requirePlayer(w http.ResponseWriter, r *http.Request) (string, bool) {
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "unauthorized", matchmaking.ErrUnauthorized.Error())
+		return "", false
+	}
+	playerID, err := s.lobby.Authenticate(token)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		return "", false
+	}
+	return playerID, true
+}
+
+func (s *Server) optionalPlayer(w http.ResponseWriter, r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	if header == "" {
+		return "", true
+	}
+	return s.requirePlayer(w, r)
+}
+
+func bearerToken(header string) (string, bool) {
+	scheme, token, ok := strings.Cut(header, " ")
+	return token, ok && strings.EqualFold(scheme, "Bearer") && token != "" && !strings.Contains(token, " ")
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
@@ -322,5 +424,20 @@ func errorCode(err error) string {
 		return "jack_not_placeable"
 	default:
 		return "internal_error"
+	}
+}
+
+func lobbyHTTPError(err error) (int, string) {
+	switch {
+	case errors.Is(err, matchmaking.ErrAlreadyQueued):
+		return http.StatusConflict, "already_queued"
+	case errors.Is(err, matchmaking.ErrAlreadyMatched):
+		return http.StatusConflict, "already_matched"
+	case errors.Is(err, matchmaking.ErrNotQueued):
+		return http.StatusConflict, "not_queued"
+	case errors.Is(err, matchmaking.ErrInvalidMatchOpts):
+		return http.StatusUnprocessableEntity, "invalid_options"
+	default:
+		return httpError(err)
 	}
 }

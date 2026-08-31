@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/sbidhya/tessera/backend/internal/config"
 	"github.com/sbidhya/tessera/backend/internal/engine"
+	matchmaking "github.com/sbidhya/tessera/backend/internal/match"
 	"github.com/sbidhya/tessera/backend/internal/room"
 	"github.com/sbidhya/tessera/backend/internal/transport"
 )
@@ -87,7 +89,15 @@ func TestRouterPreservesWebSocketUpgrade(t *testing.T) {
 	logger := discardLogger()
 	cfg := config.Config{Seed: 1}
 	manager := room.NewManager(logger, cfg.NewRand)
-	api := transport.New(manager, logger)
+	lobby, err := matchmaking.NewService(manager, logger, "test-secret", rand.Reader)
+	if err != nil {
+		t.Fatalf("new matchmaking service: %v", err)
+	}
+	identity, err := lobby.IssueIdentity()
+	if err != nil {
+		t.Fatalf("issue identity: %v", err)
+	}
+	api := transport.New(manager, lobby, logger)
 	t.Cleanup(func() {
 		api.Close()
 		manager.Shutdown()
@@ -99,10 +109,12 @@ func TestRouterPreservesWebSocketUpgrade(t *testing.T) {
 
 	server := httptest.NewServer(newRouter(logger, time.Now(), time.Now, api.Handler()))
 	t.Cleanup(server.Close)
-	wsURL := "ws" + server.URL[len("http"):] + "/v1/matches/" + match.ID() + "/ws?player_id=alice"
+	wsURL := "ws" + server.URL[len("http"):] + "/v1/matches/" + match.ID() + "/ws"
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": []string{"Bearer " + identity.Token},
+	}})
 	if err != nil {
 		t.Fatalf("websocket dial through app router: %v", err)
 	}

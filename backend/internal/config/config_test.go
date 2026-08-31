@@ -28,6 +28,9 @@ func TestDefault(t *testing.T) {
 	if cfg.DBPath != "data/tessera.db" || cfg.StoreBatchSize != 16 || cfg.StoreFlushInterval != time.Second {
 		t.Errorf("store defaults = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
 	}
+	if cfg.AuthSecret != "development-only-change-me" {
+		t.Errorf("AuthSecret = %q, want development default", cfg.AuthSecret)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -40,6 +43,7 @@ func TestLoadOverrides(t *testing.T) {
 		"TESSERA_DB_PATH":              "/tmp/tessera.db",
 		"TESSERA_STORE_BATCH_SIZE":     "8",
 		"TESSERA_STORE_FLUSH_INTERVAL": "250ms",
+		"TESSERA_AUTH_SECRET":          "test-secret",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -58,6 +62,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.DBPath != "/tmp/tessera.db" || cfg.StoreBatchSize != 8 || cfg.StoreFlushInterval != 250*time.Millisecond {
 		t.Errorf("store config = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
+	}
+	if cfg.AuthSecret != "test-secret" {
+		t.Errorf("AuthSecret = %q, want test-secret", cfg.AuthSecret)
 	}
 }
 

@@ -113,7 +113,23 @@ current one is confirmed passing.
     tests ✅; subprocess crash between terminal WAL and SQLite recovers and then
     checkpoints ✅; `go test ./...` ✅; `go test -race ./...` ✅; `go vet` +
     `gofmt` + inward-layer dependency check ✅.
-- [ ] **B6 — Matchmaking, presence, light auth**
+- [x] **B6 — Matchmaking, presence, light auth** _(PR: b6-matchmaking-auth-presence)_
+  - `internal/match` issues 128-bit anonymous player ids and HMAC-SHA256 bearer
+    tokens. Private REST state and every WebSocket action derive identity from
+    the verified token rather than trusting `player_id`; tokens remain valid
+    across restarts while `TESSERA_AUTH_SECRET` stays stable.
+  - In-memory FIFO queues are partitioned by `sequences_to_win`. The second
+    compatible player creates a room, durably reserves both seats, and exposes
+    the same match id to both players. Join/status/cancel operations are
+    idempotent or return stable conflict errors.
+  - Presence is connection-counted across live WebSockets, so replacement and
+    multiple connections cannot let one stale disconnect mark an active player
+    offline. Match snapshots retain their per-room presence view.
+  - Gate: two authenticated clients matchmake, connect, play a full game,
+    disconnect, recover private state with the same token, reconnect, and
+    finish ✅; concurrent matchmaking pairs every player exactly once ✅;
+    tampered/missing token rejection ✅; `go test ./...` ✅; `go test -race
+    ./...` ✅; `go vet` + `gofmt` + inward-layer dependency check ✅.
 
 ## Mobile (Flutter)
 
