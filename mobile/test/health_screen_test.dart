@@ -12,9 +12,7 @@ import 'package:tessera/health_screen.dart';
 /// canned client and asserts the card it renders.
 
 Future<void> pumpScreen(WidgetTester tester, http.Client client) async {
-  await tester.pumpWidget(
-    MaterialApp(home: HealthScreen(httpClient: client)),
-  );
+  await tester.pumpWidget(MaterialApp(home: HealthScreen(httpClient: client)));
   await tester.pumpAndSettle();
 }
 
@@ -88,9 +86,7 @@ void main() {
     final release = Completer<http.Response>();
     await tester.pumpWidget(
       MaterialApp(
-        home: HealthScreen(
-          httpClient: MockClient((request) => release.future),
-        ),
+        home: HealthScreen(httpClient: MockClient((request) => release.future)),
       ),
     );
     await tester.pump(); // start the launch check, but don't settle it
@@ -104,5 +100,77 @@ void main() {
     release.complete(http.Response('{"status":"ok","uptime":"0s"}', 200));
     await tester.pumpAndSettle();
     expect(find.text('Server reachable'), findsOneWidget);
+  });
+
+  testWidgets('continues to the lobby with the edited working URL', (
+    tester,
+  ) async {
+    String? selectedUrl;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HealthScreen(
+          httpClient: MockClient(
+            (request) async =>
+                http.Response('{"status":"ok","uptime":"0s"}', 200),
+          ),
+          onContinue: (url) => selectedUrl = url,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('baseUrlField')),
+      'http://game.test:9090',
+    );
+    await tester.tap(find.byKey(const Key('checkButton')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('openLobbyButton')));
+
+    expect(selectedUrl, 'http://game.test:9090');
+  });
+
+  testWidgets('editing a checked URL requires another successful check', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HealthScreen(
+          httpClient: MockClient(
+            (request) async =>
+                http.Response('{"status":"ok","uptime":"0s"}', 200),
+          ),
+          onContinue: (_) {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('openLobbyButton')), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('baseUrlField')), 'new.test');
+    await tester.pump();
+
+    expect(find.byKey(const Key('openLobbyButton')), findsNothing);
+    expect(find.text('Not checked yet'), findsOneWidget);
+  });
+
+  testWidgets('an old in-flight check cannot validate a newly edited URL', (
+    tester,
+  ) async {
+    final firstResponse = Completer<http.Response>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HealthScreen(
+          httpClient: MockClient((request) => firstResponse.future),
+          onContinue: (_) {},
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('baseUrlField')), 'new.test');
+    firstResponse.complete(http.Response('{"status":"ok","uptime":"0s"}', 200));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('openLobbyButton')), findsNothing);
+    expect(find.text('Not checked yet'), findsOneWidget);
   });
 }

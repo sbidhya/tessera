@@ -155,7 +155,25 @@ current one is confirmed passing.
     widget tests incl. in-flight disabled button); `flutter analyze` clean ✅;
     app's real client verified against a live backend (200 parsed; refused
     connection → clean error) ✅. Manual emulator play stays the gate for M2+.
-- [ ] M2 identity + lobby
+- [x] **M2 — Identity + lobby** _(PR: m2-identity-lobby)_
+  - `POST /v1/players` credentials are stored atomically with
+    `flutter_secure_storage` (iOS Keychain / Android Keystore-backed storage),
+    scoped by normalized server origin so development servers cannot share a
+    mismatched id/token pair. Secure storage stays behind an injected interface
+    for deterministic tests; the token is never rendered.
+  - A typed REST client covers room list/create and matchmaking join/leave/status,
+    strictly parses success bodies, preserves stable backend error codes, and
+    uses an abortable long-poll so timeout, cancel, and screen disposal release
+    queue membership.
+  - The lobby supports one- or two-sequence games, shows queue depth and rooms,
+    creates/selects rooms, finds an opponent, and emits a match-id/seat handoff
+    for M3/M4. Direct selection is explicitly not presented as a seated join:
+    the backend claims that seat on the M4 WebSocket connection.
+  - Platform hardening: required iOS Keychain entitlement; Android backup
+    disabled so encrypted credentials are not restored without their device key.
+  - Gate: `flutter test` 41/41 ✅; `flutter analyze` clean ✅. This host has no
+    Android SDK or full Xcode installation, so platform builds and the manual
+    two-emulator matchmaking check remain documented in `mobile/README.md`.
 - [ ] M3 board rendering
 - [ ] M4 WebSocket wiring
 - [ ] M5 full game UI

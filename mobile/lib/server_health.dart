@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'server_url.dart';
+
 /// Snapshot of the backend's `GET /healthz` endpoint.
 ///
 /// The backend (B0) answers 200 with JSON `{"status": "ok", "uptime": "1.234s"}`.
@@ -77,10 +79,10 @@ Future<ServerHealth> fetchServerHealth({
   late final Uri uri;
   late final http.Response response;
   try {
-    uri = _healthUri(baseUrl);
+    uri = serverEndpoint(baseUrl, '/healthz');
     response = await client.get(uri).timeout(timeout);
   } on ServerHealthException {
-    rethrow; // e.g. the empty-URL error from _healthUri: already well-formed.
+    rethrow;
   } on TimeoutException catch (e) {
     throw ServerHealthException(
       'timed out waiting for $baseUrl (${timeout.inSeconds}s)',
@@ -106,17 +108,4 @@ Future<ServerHealth> fetchServerHealth({
   } on FormatException catch (e) {
     throw ServerHealthException('server sent an unreadable response: $e', e);
   }
-}
-
-/// Resolves `/healthz` against [baseUrl], tolerating a missing scheme or a
-/// trailing slash in what the user typed.
-Uri _healthUri(String baseUrl) {
-  var normalized = baseUrl.trim();
-  if (normalized.isEmpty) {
-    throw const ServerHealthException('server URL is empty');
-  }
-  if (!normalized.contains('://')) {
-    normalized = 'http://$normalized';
-  }
-  return Uri.parse(normalized).resolve('/healthz');
 }
