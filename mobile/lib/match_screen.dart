@@ -245,8 +245,14 @@ class SequenceBoard extends StatelessWidget {
         ),
         child: Padding(
           padding: const EdgeInsets.all(3),
+          // Shrink-wrapped and non-scrolling: the board is static content in
+          // the screen's scroll view, not a nested viewport. This builds all
+          // 100 cells eagerly, so the Semantics labels above stay complete
+          // for screen readers on every screen size instead of depending on
+          // the viewport's cache extent.
           child: GridView.builder(
             key: const Key('sequenceBoard'),
+            shrinkWrap: true,
             physics: const NeverScrollableScrollPhysics(),
             padding: EdgeInsets.zero,
             gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
