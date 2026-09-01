@@ -139,7 +139,22 @@ current one is confirmed passing.
 
 ## Mobile (Flutter)
 
-- [ ] M1 skeleton → `/healthz` status
+- [x] **M1 — App skeleton → `/healthz` status** _(PR: m1-server-status)_
+  - Flutter 3.47 app (`mobile/`, iOS + Android only), `http` as the one
+    dependency. `lib/server_health.dart` is a pure-Dart `GET /healthz` client
+    (`ServerHealth` model + `fetchServerHealth`, injected `http.Client`,
+    5s timeout, all failures mapped to `ServerHealthException`); later blocks
+    reuse it as the connectivity probe.
+  - `lib/health_screen.dart`: editable server URL (defaults to
+    `http://10.0.2.2:8080` on Android — the emulator's host-loopback alias —
+    `http://localhost:8080` on iOS simulator), checks on launch, green
+    reachable card (`status`/`uptime`) or red unreachable card (reason).
+  - Flutter SDK lives at `/tmp/sdks/flutter` (only writable spot on this
+    machine; `/tmp` is cleared on reboot — reinstall to a permanent path).
+  - Gate: `flutter test` 17/17 ✅ (client unit tests on a mock HTTP client +
+    widget tests incl. in-flight disabled button); `flutter analyze` clean ✅;
+    app's real client verified against a live backend (200 parsed; refused
+    connection → clean error) ✅. Manual emulator play stays the gate for M2+.
 - [ ] M2 identity + lobby
 - [ ] M3 board rendering
 - [ ] M4 WebSocket wiring
