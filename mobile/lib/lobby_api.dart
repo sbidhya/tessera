@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'game_state.dart';
 import 'server_url.dart';
 
 class PlayerCredentials {
@@ -191,6 +192,34 @@ class TesseraApi {
         cause: error,
       );
     }
+  }
+
+  /// Loads one authoritative, per-viewer snapshot for the static M3 board.
+  /// B6 requires the token in the query string, so non-local deployments must
+  /// use HTTPS. The token is never stored in or rendered by the board widgets.
+  Future<MatchSnapshot> getMatchState(
+    String matchId,
+    PlayerCredentials credentials,
+  ) async {
+    if (matchId.trim().isEmpty) {
+      throw const TesseraApiException('match id is empty');
+    }
+    final endpoint = serverEndpoint(
+      baseUrl,
+      '/v1/matches/${Uri.encodeComponent(matchId)}',
+    ).replace(queryParameters: credentials.toJson());
+    final response = await _request(
+      'load match state',
+      () => client.get(endpoint),
+    );
+    _expectStatus(response, 200);
+    final snapshot = _parse('match state', response, MatchSnapshot.fromJson);
+    if (snapshot.state.matchId != matchId) {
+      throw const TesseraApiException(
+        'server returned state for another match',
+      );
+    }
+    return snapshot;
   }
 
   Future<int> matchmakingStatus() async {

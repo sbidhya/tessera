@@ -10,13 +10,20 @@ class ReadyMatch {
   final String matchId;
   final int? seat;
   final String source;
+  final PlayerCredentials credentials;
 
-  const ReadyMatch({required this.matchId, required this.source, this.seat});
+  const ReadyMatch({
+    required this.matchId,
+    required this.source,
+    required this.credentials,
+    this.seat,
+  });
 }
 
 /// M2 lobby: restore an anonymous identity, create/browse rooms, and wait in
 /// matchmaking. Board rendering and the socket that claims a direct room seat
-/// intentionally remain M3/M4 concerns.
+/// intentionally remains an M4 concern. Every successful handoff includes the
+/// credentials M3 needs to request the player's private REST snapshot.
 class LobbyScreen extends StatefulWidget {
   final http.Client httpClient;
   final CredentialStore credentialStore;
@@ -138,7 +145,11 @@ class _LobbyScreenState extends State<LobbyScreen> {
         sequencesToWin: _sequencesToWin,
       );
       if (!mounted) return;
-      final ready = ReadyMatch(matchId: match.id, source: 'Room created');
+      final ready = ReadyMatch(
+        matchId: match.id,
+        source: 'Room created',
+        credentials: _credentials!,
+      );
       setState(() {
         _readyMatch = ready;
         _matches = [
@@ -185,6 +196,7 @@ class _LobbyScreenState extends State<LobbyScreen> {
         matchId: result.matchId,
         seat: result.seat,
         source: 'Opponent found',
+        credentials: _credentials!,
       );
       setState(() => _readyMatch = ready);
       widget.onMatchReady?.call(ready);
@@ -255,7 +267,11 @@ class _LobbyScreenState extends State<LobbyScreen> {
   }
 
   void _chooseMatch(MatchSummary match) {
-    final ready = ReadyMatch(matchId: match.id, source: 'Room selected');
+    final ready = ReadyMatch(
+      matchId: match.id,
+      source: 'Room selected',
+      credentials: _credentials!,
+    );
     setState(() {
       _readyMatch = ready;
       _actionError = null;
@@ -421,7 +437,7 @@ class _LobbyScreenState extends State<LobbyScreen> {
               subtitle: Text(
                 'Match ${_readyMatch!.matchId}'
                 '${_readyMatch!.seat == null ? '' : '\nSeat ${_readyMatch!.seat}'}\n'
-                'Board handoff arrives in M3; live seat connection arrives in M4.',
+                'Opening the current board. Live seat connection arrives in M4.',
               ),
               isThreeLine: true,
             ),

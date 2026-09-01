@@ -174,7 +174,23 @@ current one is confirmed passing.
   - Gate: `flutter test` 41/41 ✅; `flutter analyze` clean ✅. This host has no
     Android SDK or full Xcode installation, so platform builds and the manual
     two-emulator matchmaking check remain documented in `mobile/README.md`.
-- [ ] M3 board rendering
+- [x] **M3 — Board rendering** _(PR: m3-board-rendering)_
+  - A typed Dart model validates the complete authoritative REST snapshot at the
+    network boundary: 100 unique cells, correct wild corners/card presence,
+    bounded and unique chips/seats, private-hand rules, status/winner
+    consistency, and every card/rank/suit enum.
+  - Lobby handoffs now carry the existing identity proof into an authenticated
+    `GET /v1/matches/{id}` and navigate to a read-only match screen. Matchmade
+    players receive their private view; direct rooms remain honest spectator
+    views until M4 opens the seat-claiming WebSocket.
+  - The responsive square board renders a 10×10 grid, red/black card faces,
+    gold free corners, distinct player chips, and a gold ring for chips locked
+    into a completed sequence. Turn/winner/viewer/presence context plus loading,
+    retry, and manual refresh states surround the board.
+  - Gate: `flutter test` 50/50 ✅; `flutter analyze` clean ✅. The end-to-end
+    health → lobby → authenticated board route is widget-tested; this host
+    still lacks Android SDK/full Xcode, so the emulator visual check remains
+    documented in `mobile/README.md`.
 - [ ] M4 WebSocket wiring
 - [ ] M5 full game UI
 - [ ] M6 reconnection UX
