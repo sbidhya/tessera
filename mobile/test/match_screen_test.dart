@@ -27,6 +27,7 @@ void main() {
   testWidgets('renders all 100 cards, corners, chips, and viewer status', (
     tester,
   ) async {
+    final semantics = tester.ensureSemantics();
     await pumpMatch(
       tester,
       MockClient((request) async {
@@ -45,6 +46,10 @@ void main() {
     expect(find.byKey(const Key('card-0-1')), findsOneWidget);
     expect(find.byKey(const Key('chip-0-1')), findsOneWidget);
     expect(find.byKey(const Key('sequence-chip-5-5')), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Row 1, column 2, A of hearts, Player 1 chip'),
+      findsOneWidget,
+    );
     expect(find.text('Your turn'), findsOneWidget);
     expect(find.textContaining('You are Player 1'), findsOneWidget);
     expect(find.text('#8'), findsOneWidget);
@@ -52,6 +57,7 @@ void main() {
     await tester.drag(find.byType(ListView), const Offset(0, -700));
     await tester.pumpAndSettle();
     expect(find.textContaining('Player 2 · away'), findsOneWidget);
+    semantics.dispose();
   });
 
   testWidgets('shows a retryable load failure and then recovers', (

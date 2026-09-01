@@ -295,6 +295,10 @@ class SequenceBoardCell extends StatelessWidget {
     return Semantics(
       label: label,
       container: true,
+      // The cell label already describes its card and chip. Hiding descendant
+      // text avoids announcements such as "Ace of hearts, A, hearts" while
+      // still leaving one complete semantic node per board position.
+      excludeSemantics: true,
       child: Container(
         key: ValueKey('board-cell-${position.row}-${position.col}'),
         decoration: BoxDecoration(
