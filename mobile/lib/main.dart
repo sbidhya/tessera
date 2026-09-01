@@ -1,21 +1,31 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
-import 'health_screen.dart';
+import 'identity_store.dart';
+import 'lobby_screen.dart';
 
-/// M1 entry point: a single screen proving the app can reach the backend.
+/// M2 entry point: the lobby (identity + matchmaking + match list).
 ///
-/// The [http.Client] is created once here (not per build) and handed to the
-/// screen; it lives for the lifetime of the app, so it is never closed.
+/// The [http.Client] and [IdentityStore] are created once here (not per
+/// build) and handed to the screen; both live for the lifetime of the app.
+/// M1's health screen remains in the repo (and tested) as the connectivity
+/// probe's original home; the lobby embeds the same `/healthz` check as a
+/// compact status row.
 void main() {
   final client = http.Client();
-  runApp(TesseraApp(httpClient: client));
+  final identityStore = InMemoryIdentityStore();
+  runApp(TesseraApp(httpClient: client, identityStore: identityStore));
 }
 
 class TesseraApp extends StatelessWidget {
   final http.Client httpClient;
+  final IdentityStore identityStore;
 
-  const TesseraApp({super.key, required this.httpClient});
+  const TesseraApp({
+    super.key,
+    required this.httpClient,
+    required this.identityStore,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -25,7 +35,7 @@ class TesseraApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
-      home: HealthScreen(httpClient: httpClient),
+      home: LobbyScreen(httpClient: httpClient, identityStore: identityStore),
     );
   }
 }

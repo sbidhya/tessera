@@ -1,7 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+/// Default server origin per platform.
+///
+/// `localhost` on a phone points at the phone itself, not the dev machine:
+/// the Android emulator aliases the host loopback as `10.0.2.2`, while the
+/// iOS simulator shares the Mac's network so plain `localhost` works.
+/// The field is editable regardless — this is just the starting guess.
+String defaultBaseUrl(TargetPlatform platform) =>
+    platform == TargetPlatform.android
+    ? 'http://10.0.2.2:8080'
+    : 'http://localhost:8080';
 
 /// Snapshot of the backend's `GET /healthz` endpoint.
 ///

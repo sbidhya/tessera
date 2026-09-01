@@ -155,7 +155,29 @@ current one is confirmed passing.
     widget tests incl. in-flight disabled button); `flutter analyze` clean ✅;
     app's real client verified against a live backend (200 parsed; refused
     connection → clean error) ✅. Manual emulator play stays the gate for M2+.
-- [ ] M2 identity + lobby
+- [x] **M2 — Identity + lobby** _(PR: sbidhya/m2-identity-lobby)_
+  - `lib/tessera_api.dart`: pure REST client for `POST /v1/players`,
+    `POST|GET /v1/matches`, `POST /v1/matchmaking/join|leave`,
+    `GET /v1/matchmaking/status`. One `TesseraApiException` carrying the
+    server's stable error `code` (`auth_disabled`, `invalid_token`,
+    `timeout`, …); request bodies send exactly the fields the backend
+    allows (it rejects unknown fields); the 204 "left queue" outcome is a
+    `null` return, not an error; the long-poll has a ~30s client budget.
+  - `lib/identity_store.dart`: `IdentityStore` seam + in-memory
+    implementation — the UI never learns where the token lives, so moving
+    to `flutter_secure_storage` later is a one-class swap (noted in
+    `mobile/README.md`).
+  - `lib/lobby_screen.dart`: server row (reuses the M1 `/healthz` probe),
+    identity card (create/forget, `auth_disabled` guidance), lobby card
+    (sequences-to-win 1/2 selector, find/cancel matchmaking with stale
+    long-poll generation guard, direct create), public match list, active
+    match card (id + seat). `defaultBaseUrl` moved to `server_health.dart`
+    so both screens share it.
+  - Gate: `flutter test` 48/48 ✅ (20 API client + 11 lobby widget, mock
+    HTTP); `flutter analyze` clean ✅; `dart format` clean ✅; throwaway
+    live smoke test — real `TesseraApi` against a local backend, two
+    clients paired into one match with seats {0, 1} — passed ✅ (not
+    committed). Manual emulator play stays the gate for M2+.
 - [ ] M3 board rendering
 - [ ] M4 WebSocket wiring
 - [ ] M5 full game UI

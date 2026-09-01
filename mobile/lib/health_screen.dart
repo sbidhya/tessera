@@ -4,15 +4,6 @@ import 'package:http/http.dart' as http;
 
 import 'server_health.dart';
 
-/// Default server origin per platform.
-///
-/// `localhost` on a phone points at the phone itself, not the dev machine:
-/// the Android emulator aliases the host loopback as `10.0.2.2`, while the
-/// iOS simulator shares the Mac's network so plain `localhost` works.
-/// The field is editable regardless — this is just the starting guess.
-String defaultBaseUrl(TargetPlatform platform) =>
-    platform == TargetPlatform.android ? 'http://10.0.2.2:8080' : 'http://localhost:8080';
-
 /// M1 screen: prove the app can reach the backend's `GET /healthz`.
 ///
 /// Shows the reported status/uptime on success and the failure reason
