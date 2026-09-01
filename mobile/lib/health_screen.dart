@@ -11,19 +11,23 @@ import 'server_health.dart';
 /// iOS simulator shares the Mac's network so plain `localhost` works.
 /// The field is editable regardless — this is just the starting guess.
 String defaultBaseUrl(TargetPlatform platform) =>
-    platform == TargetPlatform.android ? 'http://10.0.2.2:8080' : 'http://localhost:8080';
+    platform == TargetPlatform.android
+    ? 'http://10.0.2.2:8080'
+    : 'http://localhost:8080';
 
-/// M1 screen: prove the app can reach the backend's `GET /healthz`.
+/// Entry screen: prove the app can reach the backend's `GET /healthz`.
 ///
 /// Shows the reported status/uptime on success and the failure reason
-/// otherwise. Later blocks (M2+) will reuse [fetchServerHealth] as the
-/// connectivity probe underneath the lobby.
+/// otherwise, then hands the confirmed origin to the M2 lobby.
 class HealthScreen extends StatefulWidget {
   /// HTTP client used for health checks. Injected so tests can pass a mock;
   /// production passes a real `http.Client` from `main()`.
   final http.Client httpClient;
 
-  const HealthScreen({super.key, required this.httpClient});
+  /// Called with the working server URL when the user proceeds to M2.
+  final ValueChanged<String>? onContinue;
+
+  const HealthScreen({super.key, required this.httpClient, this.onContinue});
 
   @override
   State<HealthScreen> createState() => _HealthScreenState();
@@ -36,6 +40,7 @@ class _HealthScreenState extends State<HealthScreen> {
   _CheckState _state = _CheckState.idle;
   ServerHealth? _health;
   String? _error;
+  int _checkGeneration = 0;
 
   @override
   void initState() {
@@ -55,6 +60,8 @@ class _HealthScreenState extends State<HealthScreen> {
   }
 
   Future<void> _check() async {
+    final generation = ++_checkGeneration;
+    final baseUrl = _urlController.text;
     setState(() {
       _state = _CheckState.checking;
       _error = null;
@@ -62,15 +69,15 @@ class _HealthScreenState extends State<HealthScreen> {
     try {
       final health = await fetchServerHealth(
         client: widget.httpClient,
-        baseUrl: _urlController.text,
+        baseUrl: baseUrl,
       );
-      if (!mounted) return;
+      if (!mounted || generation != _checkGeneration) return;
       setState(() {
         _state = _CheckState.ok;
         _health = health;
       });
     } on ServerHealthException catch (e) {
-      if (!mounted) return;
+      if (!mounted || generation != _checkGeneration) return;
       setState(() {
         _state = _CheckState.error;
         _error = e.message;
@@ -97,6 +104,18 @@ class _HealthScreenState extends State<HealthScreen> {
                 hintText: 'http://localhost:8080',
                 border: OutlineInputBorder(),
               ),
+              onChanged: (_) {
+                // A successful check only applies to the URL that was checked.
+                // Hide the lobby handoff until an edited value passes again.
+                _checkGeneration++;
+                if (_state != _CheckState.idle) {
+                  setState(() {
+                    _state = _CheckState.idle;
+                    _health = null;
+                    _error = null;
+                  });
+                }
+              },
               onSubmitted: (_) => _check(),
             ),
             const SizedBox(height: 12),
@@ -108,6 +127,15 @@ class _HealthScreenState extends State<HealthScreen> {
             ),
             const SizedBox(height: 24),
             _buildStatusCard(),
+            if (_state == _CheckState.ok && widget.onContinue != null) ...[
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                key: const Key('openLobbyButton'),
+                onPressed: () => widget.onContinue!(_urlController.text),
+                icon: const Icon(Icons.sports_esports),
+                label: const Text('Open lobby'),
+              ),
+            ],
           ],
         ),
       ),

@@ -19,20 +19,20 @@ http.Client okClient() => MockClient((request) async {
 void main() {
   group('ServerHealth.fromJson', () {
     test('parses the B0 body', () {
-      final h = ServerHealth.fromJson(
-        {'status': 'ok', 'uptime': '1.002s'},
-        DateTime.utc(2026, 1, 1),
-      );
+      final h = ServerHealth.fromJson({
+        'status': 'ok',
+        'uptime': '1.002s',
+      }, DateTime.utc(2026, 1, 1));
       expect(h.status, 'ok');
       expect(h.uptime, '1.002s');
       expect(h.isOk, isTrue);
     });
 
     test('non-ok status is kept, not normalized away', () {
-      final h = ServerHealth.fromJson(
-        {'status': 'degraded', 'uptime': '0s'},
-        DateTime.now(),
-      );
+      final h = ServerHealth.fromJson({
+        'status': 'degraded',
+        'uptime': '0s',
+      }, DateTime.now());
       expect(h.isOk, isFalse);
     });
 
@@ -42,10 +42,10 @@ void main() {
         throwsFormatException,
       );
       expect(
-        () => ServerHealth.fromJson(
-          {'status': 'ok', 'uptime': 42},
-          DateTime.now(),
-        ),
+        () => ServerHealth.fromJson({
+          'status': 'ok',
+          'uptime': 42,
+        }, DateTime.now()),
         throwsFormatException,
       );
     });
@@ -74,9 +74,7 @@ void main() {
     });
 
     test('non-200 becomes ServerHealthException', () async {
-      final client = MockClient(
-        (request) async => http.Response('oops', 500),
-      );
+      final client = MockClient((request) async => http.Response('oops', 500));
       expect(
         fetchServerHealth(client: client, baseUrl: 'http://localhost:8080'),
         throwsA(
@@ -91,9 +89,7 @@ void main() {
 
     test('200 with malformed body becomes ServerHealthException', () async {
       for (final body in ['not json', '[1,2]', '{"status":42}']) {
-        final client = MockClient(
-          (request) async => http.Response(body, 200),
-        );
+        final client = MockClient((request) async => http.Response(body, 200));
         await expectLater(
           fetchServerHealth(client: client, baseUrl: 'http://localhost:8080'),
           throwsA(isA<ServerHealthException>()),
@@ -140,16 +136,21 @@ void main() {
       );
     });
 
-    test('malformed URL becomes ServerHealthException, not FormatException',
-        () async {
-      // Uri.parse throws FormatException on a non-numeric port; the screen
-      // only catches ServerHealthException, so anything else would strand it
-      // on "Checking…".
-      await expectLater(
-        fetchServerHealth(client: okClient(), baseUrl: 'http://localhost:abc'),
-        throwsA(isA<ServerHealthException>()),
-      );
-    });
+    test(
+      'malformed URL becomes ServerHealthException, not FormatException',
+      () async {
+        // Uri.parse throws FormatException on a non-numeric port; the screen
+        // only catches ServerHealthException, so anything else would strand it
+        // on "Checking…".
+        await expectLater(
+          fetchServerHealth(
+            client: okClient(),
+            baseUrl: 'http://localhost:abc',
+          ),
+          throwsA(isA<ServerHealthException>()),
+        );
+      },
+    );
   });
 
   group('defaultBaseUrl', () {
