@@ -5,8 +5,10 @@ import 'package:http/http.dart' as http;
 import 'health_screen.dart';
 import 'identity_store.dart';
 import 'lobby_screen.dart';
+import 'match_screen.dart';
 
-/// Mobile entry point: verify the configured backend, then enter the M2 lobby.
+/// Mobile entry point: verify the backend, enter the lobby, then render the
+/// selected match's authoritative REST state.
 ///
 /// The [http.Client] is created once here (not per build) and handed to the
 /// screen; it lives for the lifetime of the app, so it is never closed.
@@ -52,6 +54,18 @@ class TesseraApp extends StatelessWidget {
                   httpClient: httpClient,
                   credentialStore: credentialStore,
                   baseUrl: baseUrl,
+                  onMatchReady: (match) {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => MatchScreen(
+                          httpClient: httpClient,
+                          baseUrl: baseUrl,
+                          matchId: match.matchId,
+                          credentials: match.credentials,
+                        ),
+                      ),
+                    );
+                  },
                 ),
               ),
             );

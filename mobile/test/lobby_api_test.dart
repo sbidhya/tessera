@@ -7,6 +7,8 @@ import 'package:http/testing.dart';
 import 'package:tessera/lobby_api.dart';
 import 'package:tessera/server_url.dart';
 
+import 'support/match_fixture.dart';
+
 const credentials = PlayerCredentials(playerId: 'p_alice', token: 'proof');
 
 Map<String, Object> matchJson(String id) => {
@@ -86,6 +88,23 @@ void main() {
     expect(matches.single.id, 'r_one');
     expect(created.id, 'r_two');
     expect(requested, ['GET /v1/matches', 'POST /v1/matches']);
+  });
+
+  test('loads a typed private match state with identity proof', () async {
+    final api = TesseraApi(
+      baseUrl: 'http://server.test',
+      client: MockClient((request) async {
+        expect(request.method, 'GET');
+        expect(request.url.path, '/v1/matches/r_board');
+        expect(request.url.queryParameters, credentials.toJson());
+        return matchSnapshotResponse();
+      }),
+    );
+
+    final snapshot = await api.getMatchState('r_board', credentials);
+    expect(snapshot.seq, 8);
+    expect(snapshot.state.board, hasLength(100));
+    expect(snapshot.state.viewer, 0);
   });
 
   test(

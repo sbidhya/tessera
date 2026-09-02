@@ -146,6 +146,7 @@ void main() {
     expect(find.text('Opponent found'), findsOneWidget);
     expect(find.textContaining('Seat 1'), findsOneWidget);
     expect(ready.single.matchId, 'r_pair');
+    expect(ready.single.credentials.playerId, 'p_saved');
   });
 
   testWidgets('cancel search leaves the server queue', (tester) async {
