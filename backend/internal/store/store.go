@@ -86,7 +86,14 @@ type Store struct {
 	closeErr   error
 }
 
-type archiveCmd struct{ match room.FinishedMatch }
+type archiveCmd struct {
+	match    room.FinishedMatch
+	archived func()
+}
+type pendingArchive struct {
+	match     room.FinishedMatch
+	callbacks []func()
+}
 type flushCmd struct{ reply chan error }
 type closeCmd struct{ reply chan error }
 
@@ -206,14 +213,14 @@ func migrate(db *sql.DB) error {
 
 // MatchFinished implements room.FinishedMatchSink. It only copies the value
 // into the worker queue; disk I/O remains off the room actor's hot path.
-func (s *Store) MatchFinished(match room.FinishedMatch) {
+func (s *Store) MatchFinished(match room.FinishedMatch, archived func()) {
 	select {
 	case <-s.done:
 		return
 	default:
 	}
 	select {
-	case s.commands <- archiveCmd{match: cloneMatch(match)}:
+	case s.commands <- archiveCmd{match: cloneMatch(match), archived: archived}:
 	case <-s.done:
 	}
 }
@@ -258,14 +265,19 @@ func (s *Store) Close() error {
 func (s *Store) loop() {
 	ticker := time.NewTicker(s.flushEvery)
 	defer ticker.Stop()
-	pending := make(map[string]room.FinishedMatch)
+	pending := make(map[string]pendingArchive)
 
 	for {
 		select {
 		case raw := <-s.commands:
 			switch cmd := raw.(type) {
 			case archiveCmd:
-				pending[cmd.match.RoomID] = cmd.match
+				item := pending[cmd.match.RoomID]
+				item.match = cmd.match
+				if cmd.archived != nil {
+					item.callbacks = append(item.callbacks, cmd.archived)
+				}
+				pending[cmd.match.RoomID] = item
 				if len(pending) >= s.batchSize {
 					if err := s.flushOne(pending); err != nil {
 						s.logger.Error("archive finished matches", "err", err, "pending", len(pending))
@@ -285,7 +297,7 @@ func (s *Store) loop() {
 	}
 }
 
-func (s *Store) flushAll(pending map[string]room.FinishedMatch) error {
+func (s *Store) flushAll(pending map[string]pendingArchive) error {
 	for len(pending) > 0 {
 		if err := s.flushOne(pending); err != nil {
 			return err
@@ -294,7 +306,7 @@ func (s *Store) flushAll(pending map[string]room.FinishedMatch) error {
 	return nil
 }
 
-func (s *Store) flushOne(pending map[string]room.FinishedMatch) error {
+func (s *Store) flushOne(pending map[string]pendingArchive) error {
 	ids := make([]string, 0, len(pending))
 	for id := range pending {
 		ids = append(ids, id)
@@ -305,9 +317,22 @@ func (s *Store) flushOne(pending map[string]room.FinishedMatch) error {
 	}
 	batch := make([]room.FinishedMatch, 0, len(ids))
 	for _, id := range ids {
-		batch = append(batch, pending[id])
+		batch = append(batch, pending[id].match)
 	}
-	if err := s.persistBatch(batch); err != nil {
+	if err := s.persistBatch(batch, func() {
+		// A committed SQLite row is enough to make the live room evictable. Clear
+		// callbacks before invoking them so a later WAL-checkpoint retry cannot
+		// acknowledge the same archival twice.
+		for _, id := range ids {
+			item := pending[id]
+			callbacks := item.callbacks
+			item.callbacks = nil
+			pending[id] = item
+			for _, archived := range callbacks {
+				archived()
+			}
+		}
+	}); err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -316,7 +341,7 @@ func (s *Store) flushOne(pending map[string]room.FinishedMatch) error {
 	return nil
 }
 
-func (s *Store) persistBatch(batch []room.FinishedMatch) error {
+func (s *Store) persistBatch(batch []room.FinishedMatch, committed func()) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -334,6 +359,9 @@ func (s *Store) persistBatch(batch []room.FinishedMatch) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit archive transaction: %w", err)
+	}
+	if committed != nil {
+		committed()
 	}
 
 	// The transaction is durable before any WAL bytes are discarded. If a
@@ -516,6 +544,17 @@ func (s *Store) Match(ctx context.Context, id string) (Match, error) {
 		return Match{}, fmt.Errorf("store: parse archived time for %s: %w", id, err)
 	}
 	return result, nil
+}
+
+// HasMatch reports whether id has reached the cold tier. It is the narrow
+// lookup used by transport to distinguish an evicted archived match from an
+// id that never existed.
+func (s *Store) HasMatch(ctx context.Context, id string) (bool, error) {
+	_, err := s.Match(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // History returns the accepted event stream stored for one finished match.

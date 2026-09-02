@@ -114,7 +114,7 @@ func TestPersistsMatchHistoryAndStatsBeforeCheckpoint(t *testing.T) {
 		return nil
 	}
 
-	s.MatchFinished(match)
+	s.MatchFinished(match, nil)
 	if err := s.Flush(t.Context()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
@@ -137,6 +137,15 @@ func TestPersistsMatchHistoryAndStatsBeforeCheckpoint(t *testing.T) {
 	assertStats(t, s, "bob", 1, 0, 1, 1)
 	if checkpoint.callCount() != 1 {
 		t.Errorf("checkpoint calls = %d, want 1", checkpoint.callCount())
+	}
+	for id, want := range map[string]bool{match.RoomID: true, "r_missing": false} {
+		found, err := s.HasMatch(t.Context(), id)
+		if err != nil {
+			t.Fatalf("HasMatch(%s): %v", id, err)
+		}
+		if found != want {
+			t.Errorf("HasMatch(%s) = %t, want %t", id, found, want)
+		}
 	}
 }
 
@@ -161,7 +170,7 @@ func TestCheckpointRetryDoesNotDoubleCountStats(t *testing.T) {
 	checkpoint := &checkpointRecorder{failures: 1}
 	s := testStore(t, checkpoint, 8)
 	match := finishedMatch("r_retry", "bob")
-	s.MatchFinished(match)
+	s.MatchFinished(match, nil)
 
 	if err := s.Flush(t.Context()); err == nil {
 		t.Fatal("first Flush succeeded despite checkpoint failure")
@@ -181,11 +190,31 @@ func TestCheckpointRetryDoesNotDoubleCountStats(t *testing.T) {
 	}
 }
 
+func TestArchiveAcknowledgedAfterCommitDespiteCheckpointFailure(t *testing.T) {
+	checkpoint := &checkpointRecorder{failures: 1}
+	s := testStore(t, checkpoint, 8)
+	acknowledged := make(chan struct{})
+	s.MatchFinished(finishedMatch("r_ack", "alice"), func() { close(acknowledged) })
+
+	if err := s.Flush(t.Context()); err == nil {
+		t.Fatal("first Flush succeeded despite checkpoint failure")
+	}
+	select {
+	case <-acknowledged:
+	default:
+		t.Fatal("committed archive was not acknowledged after its WAL checkpoint failed")
+	}
+
+	if err := s.Flush(t.Context()); err != nil {
+		t.Fatalf("retry Flush: %v", err)
+	}
+}
+
 func TestBatchAggregatesPlayerStats(t *testing.T) {
 	checkpoint := &checkpointRecorder{notified: make(chan checkpointCall, 2)}
 	s := testStore(t, checkpoint, 2)
-	s.MatchFinished(finishedMatch("r_batch_a", "alice"))
-	s.MatchFinished(finishedMatch("r_batch_b", "bob"))
+	s.MatchFinished(finishedMatch("r_batch_a", "alice"), nil)
+	s.MatchFinished(finishedMatch("r_batch_b", "bob"), nil)
 	for range 2 {
 		select {
 		case <-checkpoint.notified:
@@ -206,7 +235,7 @@ func TestPartialBatchFlushesOnInterval(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	s.MatchFinished(finishedMatch("r_interval", "alice"))
+	s.MatchFinished(finishedMatch("r_interval", "alice"), nil)
 	select {
 	case <-checkpoint.notified:
 	case <-time.After(2 * time.Second):
@@ -220,7 +249,7 @@ func TestArchiveIsIdempotent(t *testing.T) {
 	s := testStore(t, checkpoint, 8)
 	match := finishedMatch("r_duplicate", "alice")
 	for range 2 {
-		s.MatchFinished(match)
+		s.MatchFinished(match, nil)
 		if err := s.Flush(t.Context()); err != nil {
 			t.Fatalf("Flush: %v", err)
 		}

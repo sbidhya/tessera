@@ -61,6 +61,14 @@ With the B6 identity layer enabled, `player_id` must be accompanied by its
 "token"}` in POST bodies). Without the layer, any `player_id` is accepted as
 before. The spectator view (no `player_id`) never needs a token.
 
+Finished matches remain in the live room tier for a reconnect grace window
+after SQLite archival (five minutes by default, configured with
+`TESSERA_FINISHED_MATCH_RETENTION`). During that window this endpoint returns
+the final snapshot normally. After eviction it returns HTTP `410 Gone` with the
+stable code `match_archived`; an id absent from both the live manager and SQLite
+still returns `404 match_not_found`. Archived matches are omitted from
+`GET /v1/matches`, and their WebSocket endpoint is no longer available.
+
 ## WebSocket
 
 Connect with:

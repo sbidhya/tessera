@@ -65,7 +65,9 @@ func run() error {
 		return err
 	}
 
-	manager, err := room.NewPersistentManager(logger, cfg.NewRand, journal, coldStore)
+	manager, err := room.NewPersistentManagerWithOptions(logger, cfg.NewRand, journal, coldStore, room.ManagerOptions{
+		FinishedRetention: cfg.FinishedMatchRetention,
+	})
 	if err != nil {
 		_ = coldStore.Close()
 		_ = journal.Close()
@@ -94,6 +96,7 @@ func run() error {
 		Auth:       authenticator,
 		Matchmaker: matchmaker,
 		Presence:   presence,
+		Archive:    coldStore,
 	})
 	defer func() {
 		api.Close()

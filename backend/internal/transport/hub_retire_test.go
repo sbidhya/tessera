@@ -74,3 +74,33 @@ func TestHubRetiresAfterMatchFinishes(t *testing.T) {
 		t.Fatalf("len(Server.hubs) = %d after match completion, want 0", remaining)
 	}
 }
+
+func TestRoomEvictionRetiresActiveHub(t *testing.T) {
+	b := newTestBackend(t, 43)
+	matchID := createMatch(t, b.http.URL, 1).Match.ID
+	client := dialPlayer(t, b.http.URL, matchID, "alice")
+	defer client.CloseNow()
+	_ = readStateAtLeast(t, client, 2)
+
+	b.api.mu.Lock()
+	hub := b.api.hubs[matchID]
+	b.api.mu.Unlock()
+	if hub == nil {
+		t.Fatal("no active hub before room eviction")
+	}
+
+	// Manager invokes this registered hook when an archived room's retention
+	// timer expires. An active socket must not keep the transport actor alive.
+	b.api.retireHub(matchID)
+	select {
+	case <-hub.done:
+	default:
+		t.Fatal("active hub did not exit during room eviction")
+	}
+	b.api.mu.Lock()
+	_, stillRegistered := b.api.hubs[matchID]
+	b.api.mu.Unlock()
+	if stillRegistered {
+		t.Fatal("Server.hubs still holds an evicted room's hub")
+	}
+}

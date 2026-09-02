@@ -31,6 +31,13 @@ type Deps struct {
 	Auth       *auth.Authenticator
 	Matchmaker *match.Matchmaker
 	Presence   *match.Presence
+	Archive    ArchiveLookup
+}
+
+// ArchiveLookup is the cold-tier query transport needs after a finished room
+// has left the live Manager directory.
+type ArchiveLookup interface {
+	HasMatch(ctx context.Context, id string) (bool, error)
 }
 
 // Server owns the B3 HTTP routes and the live WebSocket hubs. The room manager
@@ -43,6 +50,7 @@ type Server struct {
 	auth       *auth.Authenticator
 	matchmaker *match.Matchmaker
 	presence   *match.Presence
+	archive    ArchiveLookup
 
 	mu     sync.Mutex
 	hubs   map[string]*matchHub
@@ -64,7 +72,9 @@ func NewWithDeps(manager *room.Manager, logger *slog.Logger, deps Deps) *Server 
 		auth:       deps.Auth,
 		matchmaker: deps.Matchmaker,
 		presence:   deps.Presence,
+		archive:    deps.Archive,
 	}
+	manager.SetEvictionHandler(s.retireHub)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/matches", s.createMatch)
 	mux.HandleFunc("GET /v1/matches", s.listMatches)
@@ -154,7 +164,7 @@ func (s *Server) listMatches(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 	match, ok := s.manager.Get(r.PathValue("matchID"))
 	if !ok {
-		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
+		s.writeMissingMatch(w, r)
 		return
 	}
 	// A private view (player_id given) requires the matching token; the
@@ -165,11 +175,33 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 	}
 	snap, err := match.Snapshot(r.Context(), playerID)
 	if err != nil {
+		// Retention may expire between Manager.Get and Snapshot. The room is
+		// already archived at that point, so use the same cold-tier response as a
+		// lookup that missed the live directory initially.
+		if errors.Is(err, room.ErrRoomClosed) {
+			s.writeMissingMatch(w, r)
+			return
+		}
 		status, code := httpError(err)
 		writeError(w, status, code, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, stateResponse{Seq: snap.Seq, State: stateFromSnapshot(snap)})
+}
+
+func (s *Server) writeMissingMatch(w http.ResponseWriter, r *http.Request) {
+	if s.archive != nil {
+		archived, err := s.archive.HasMatch(r.Context(), r.PathValue("matchID"))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not query archived match")
+			return
+		}
+		if archived {
+			writeError(w, http.StatusGone, "match_archived", "match is archived and no longer accepts live state requests")
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "match_not_found", "match not found")
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +358,21 @@ func (s *Server) removeHub(h *matchHub) {
 	if cur, ok := s.hubs[h.id]; ok && cur == h {
 		h.terminating = true
 		delete(s.hubs, h.id)
+	}
+}
+
+// retireHub is Manager's room-eviction hook. It removes the hub before asking
+// it to stop so hubFor cannot hand out a transport actor whose room is gone.
+func (s *Server) retireHub(matchID string) {
+	s.mu.Lock()
+	h := s.hubs[matchID]
+	if h != nil {
+		h.terminating = true
+		delete(s.hubs, matchID)
+	}
+	s.mu.Unlock()
+	if h != nil {
+		h.Close()
 	}
 }
 

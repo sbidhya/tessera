@@ -16,6 +16,9 @@ winning move -> fsync WAL -> publish finished room -> enqueue archive -> ack
                                                    |
                                                    v
                        batch SQLite transaction -> commit -> checkpoint WAL
+                                                       |
+                                                       v
+                                 start retention window -> evict room + hub
 ```
 
 This ordering deliberately leaves two safe crash outcomes:
@@ -25,6 +28,10 @@ This ordering deliberately leaves two safe crash outcomes:
 - A crash after the SQLite commit but before the WAL checkpoint leaves both
   copies. The match id makes the repeated SQL transaction a no-op, so player
   statistics are not counted twice; checkpointing then finishes normally.
+
+The successful SQLite commit acknowledges archival and starts the room's
+retention window. A WAL checkpoint failure is retried but does not keep the
+already-archived live room resident forever.
 
 The WAL is never truncated first. A checkpoint also verifies that the requested
 terminal sequence is the file's final event, preventing an unarchived suffix
@@ -62,6 +69,9 @@ driver and schema live in `internal/store`.
 - `TESSERA_STORE_BATCH_SIZE` — maximum matches per transaction; default `16`.
 - `TESSERA_STORE_FLUSH_INTERVAL` — maximum wait for a partial batch, as a Go
   duration; default `1s`.
+- `TESSERA_FINISHED_MATCH_RETENTION` — reconnect grace window after archival;
+  default `5m`. When it expires, the room actor and transport hub stop and the
+  in-memory idempotency map and event history are released.
 
 The implementation uses `modernc.org/sqlite`, a pure-Go `database/sql` driver,
 so builds do not require a C compiler or a system SQLite installation.
