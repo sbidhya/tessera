@@ -2,12 +2,14 @@ package room
 
 import (
 	"cmp"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/engine"
 )
@@ -19,6 +21,14 @@ import (
 // engine and the standard library only — the layering stays a straight line and
 // tests can inject any RNG they like.
 type RandFunc func(stream string) *rand.Rand
+
+// DefaultRetention is the grace window a finished, archived match stays live
+// before Sweep evicts it. It mirrors config.DefaultRoomRetention (kept as a
+// literal here so room keeps importing engine and the standard library only).
+// Five minutes covers an immediate reconnect after the winning move without
+// keeping every finished match's goroutine, idempotency map, and event
+// history alive forever.
+const DefaultRetention = 5 * time.Minute
 
 // Manager is the process-wide registry of live rooms.
 //
@@ -36,6 +46,16 @@ type Manager struct {
 	rooms  map[string]*Room
 	ids    *rand.Rand
 	closed bool
+
+	// Retention policy for finished matches. retention is the grace window
+	// after the winning move; now is the injectable clock (time.Now in
+	// production, a fake in tests); archived records ids the cold tier has
+	// durably stored (via NotifyArchived); onEvict runs after each eviction
+	// so transport can tear down the match's hub (P0-1 coordination).
+	retention time.Duration
+	now       func() time.Time
+	archived  map[string]bool
+	onEvict   func(roomID string)
 }
 
 // NewManager builds an empty manager. randFor supplies each room's RNG stream,
@@ -71,13 +91,127 @@ func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, arc
 		logger = slog.Default()
 	}
 	return &Manager{
-		logger:  logger,
-		randFor: randFor,
-		journal: journal,
-		archive: archive,
-		rooms:   make(map[string]*Room),
-		ids:     randFor("room-ids"),
+		logger:    logger,
+		randFor:   randFor,
+		journal:   journal,
+		archive:   archive,
+		rooms:     make(map[string]*Room),
+		ids:       randFor("room-ids"),
+		retention: DefaultRetention,
+		now:       time.Now,
+		archived:  make(map[string]bool),
 	}
+}
+
+// SetRetention configures the finished-match grace window and the clock Sweep
+// uses to measure it. A non-positive ttl selects DefaultRetention; a nil clock
+// selects time.Now. It exists so tests can inject a fake clock and advance
+// past the window without sleeping, while production passes
+// config.RoomRetention with the wall clock.
+func (m *Manager) SetRetention(ttl time.Duration, now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ttl <= 0 {
+		ttl = DefaultRetention
+	}
+	if now == nil {
+		now = time.Now
+	}
+	m.retention = ttl
+	m.now = now
+}
+
+// SetEvictHook registers fn to run after each retention eviction (and each
+// explicit Close, which can also orphan a hub). Transport wires its hub
+// teardown here so evicting a room also retires its hub. A nil fn disables
+// the hook. Called outside the directory lock, after the room goroutine has
+// exited.
+func (m *Manager) SetEvictHook(fn func(roomID string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvict = fn
+}
+
+// NotifyArchived records that id has been durably stored in the SQLite cold
+// tier. It is called by the store worker after its commit (see
+// store.Options.OnArchived), not by the room actor at enqueue time: eviction
+// requires the commit, not just the queue. It is idempotent and safe to call
+// before the room has finished (the flag waits for the finish timestamp).
+func (m *Manager) NotifyArchived(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.archived[id] = true
+}
+
+// Sweep evicts every room whose match finished at least retention ago AND has
+// been archived. Rooms without a cold tier (nil archive sink) treat the
+// finish itself as archived. Sweep is explicit rather than timer-driven so
+// tests can drive it with a fake clock; production runs it on a ticker (see
+// cmd/tessera) plus after each store commit.
+func (m *Manager) Sweep() {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		rooms = append(rooms, r)
+	}
+	now := m.now()
+	ttl := m.retention
+	if ttl <= 0 {
+		ttl = DefaultRetention
+	}
+	m.mu.Unlock()
+
+	for _, r := range rooms {
+		snap, err := r.Snapshot(context.Background(), "")
+		if err != nil {
+			continue // closed concurrently; directory already dropped it
+		}
+		if snap.Status != StatusFinished || snap.FinishedAt.IsZero() {
+			continue
+		}
+		if now.Before(snap.FinishedAt.Add(ttl)) {
+			continue // still in the reconnect grace window
+		}
+		m.mu.Lock()
+		archived := m.archive == nil || m.archived[r.id]
+		m.mu.Unlock()
+		if !archived {
+			continue // SQLite has not committed this match yet
+		}
+		m.evict(r.id)
+	}
+}
+
+// evict unregisters id, stops its goroutine (which frees its applied map and
+// events slice on the owning goroutine), and runs the evict hook. It is a
+// no-op for unknown ids so concurrent Close/Sweep pairs cannot fail.
+func (m *Manager) evict(id string) {
+	m.mu.Lock()
+	r, ok := m.rooms[id]
+	if ok {
+		delete(m.rooms, id)
+	}
+	delete(m.archived, id)
+	hook := m.onEvict
+	m.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	// Closed outside the lock for the same reason Close documents: Close
+	// waits for the room goroutine, which must not block directory lookups.
+	r.Close()
+	if hook != nil {
+		hook(id)
+	}
+	m.logger.Info("room evicted", "room", id)
 }
 
 // Create starts a new room and registers it.
@@ -107,6 +241,7 @@ func (m *Manager) Create(opts engine.Options) (*Room, error) {
 		return nil, err
 	}
 	r.archive = m.archive
+	r.now = m.now
 	r.start()
 	m.rooms[id] = r
 	m.logger.Info("room created", "room", id, "players", r.gs.NumPlayers,
@@ -141,6 +276,15 @@ func (m *Manager) recover() error {
 		}
 		r.journal = m.journal
 		r.archive = m.archive
+		r.now = m.now
+		if r.status == StatusFinished {
+			// The WAL carries no finish timestamp, so anchor the grace
+			// window at recovery: a crash must not evict a finished match
+			// before clients have had a chance to reconnect, nor resurrect
+			// it forever. Replay's playMove stamped finishedAt with the
+			// standalone clock; overwrite it with the manager clock.
+			r.finishedAt = m.now()
+		}
 		recovered = append(recovered, r)
 	}
 	for _, r := range recovered {
@@ -271,6 +415,8 @@ func (m *Manager) Close(id string) error {
 	m.mu.Lock()
 	r, ok := m.rooms[id]
 	delete(m.rooms, id)
+	delete(m.archived, id)
+	hook := m.onEvict
 	m.mu.Unlock()
 
 	if !ok {
@@ -280,6 +426,9 @@ func (m *Manager) Close(id string) error {
 	// and holding the directory lock across that wait would let one slow room
 	// block every lookup in the process.
 	r.Close()
+	if hook != nil {
+		hook(id)
+	}
 	m.logger.Info("room closed", "room", id)
 	return nil
 }
@@ -294,6 +443,7 @@ func (m *Manager) Shutdown() {
 		rooms = append(rooms, r)
 	}
 	m.rooms = make(map[string]*Room)
+	m.archived = make(map[string]bool)
 	m.mu.Unlock()
 
 	for _, r := range rooms {

@@ -31,6 +31,11 @@ type Deps struct {
 	Auth       *auth.Authenticator
 	Matchmaker *match.Matchmaker
 	Presence   *match.Presence
+	// IsArchived reports whether id exists in the SQLite cold tier. It lets
+	// GET /v1/matches/{id} answer 410 match_archived for an evicted match
+	// instead of 404. A nil func disables the lookup (every miss is 404),
+	// which is what in-memory tests without a cold tier use.
+	IsArchived func(ctx context.Context, id string) (bool, error)
 }
 
 // Server owns the B3 HTTP routes and the live WebSocket hubs. The room manager
@@ -43,6 +48,7 @@ type Server struct {
 	auth       *auth.Authenticator
 	matchmaker *match.Matchmaker
 	presence   *match.Presence
+	isArchived func(ctx context.Context, id string) (bool, error)
 
 	mu     sync.Mutex
 	hubs   map[string]*matchHub
@@ -64,6 +70,7 @@ func NewWithDeps(manager *room.Manager, logger *slog.Logger, deps Deps) *Server 
 		auth:       deps.Auth,
 		matchmaker: deps.Matchmaker,
 		presence:   deps.Presence,
+		isArchived: deps.IsArchived,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/matches", s.createMatch)
@@ -154,6 +161,11 @@ func (s *Server) listMatches(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 	match, ok := s.manager.Get(r.PathValue("matchID"))
 	if !ok {
+		if s.isArchivedMatch(r.Context(), r.PathValue("matchID")) {
+			writeError(w, http.StatusGone, "match_archived",
+				"match has been archived to the cold tier; reconnect sooner after the winning move")
+			return
+		}
 		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
 		return
 	}
@@ -184,7 +196,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	match, ok := s.manager.Get(r.PathValue("matchID"))
 	if !ok {
-		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
+		if s.isArchivedMatch(r.Context(), r.PathValue("matchID")) {
+			writeError(w, http.StatusGone, "match_archived",
+				"match has been archived to the cold tier; reconnect sooner after the winning move")
+		} else {
+			writeError(w, http.StatusNotFound, "match_not_found", "match not found")
+		}
 		return
 	}
 	// Refuse before the upgrade when the shutdown already happened, so the
@@ -340,6 +357,41 @@ func (s *Server) isClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
+}
+
+// CloseHub stops and unregisters the hub for id. The room manager calls it
+// through its evict hook so a retention eviction also retires the hub: the
+// room goroutine is already gone, so any sockets still attached would only
+// see ErrRoomClosed on their next op. It is a no-op when no hub is
+// registered (already retired after the last disconnect, or never created).
+// Like Server.Close it never holds s.mu across matchHub.Close.
+func (s *Server) CloseHub(id string) {
+	s.mu.Lock()
+	h, ok := s.hubs[id]
+	if ok {
+		h.terminating = true
+		delete(s.hubs, id)
+	}
+	s.mu.Unlock()
+	if ok {
+		h.Close()
+	}
+}
+
+// isArchivedMatch consults the cold tier to distinguish an evicted match
+// (410 match_archived) from a never-existed one (404 match_not_found). A nil
+// lookup or a lookup error fails closed to "not archived" so a sick SQLite
+// never turns every missing match into a 410.
+func (s *Server) isArchivedMatch(ctx context.Context, id string) bool {
+	if s.isArchived == nil {
+		return false
+	}
+	ok, err := s.isArchived(ctx, id)
+	if err != nil {
+		s.logger.Warn("cold-tier archived lookup failed", "match", id, "err", err)
+		return false
+	}
+	return ok
 }
 
 // checkAuth verifies the player's token when the identity layer is enabled

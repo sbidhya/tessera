@@ -62,6 +62,10 @@ driver and schema live in `internal/store`.
 - `TESSERA_STORE_BATCH_SIZE` — maximum matches per transaction; default `16`.
 - `TESSERA_STORE_FLUSH_INTERVAL` — maximum wait for a partial batch, as a Go
   duration; default `1s`.
+- `TESSERA_ROOM_RETENTION` — finished-match grace window before the room
+  manager evicts the actor; default `5m`. The store notifies the manager via
+  `Options.OnArchived` after each SQLite commit (not at enqueue time), which
+  is the second half of the eviction gate alongside `StatusFinished`.
 
 The implementation uses `modernc.org/sqlite`, a pure-Go `database/sql` driver,
 so builds do not require a C compiler or a system SQLite installation.

@@ -46,6 +46,12 @@ type Checkpointer interface {
 type Options struct {
 	BatchSize     int
 	FlushInterval time.Duration
+	// OnArchived, when non-nil, runs after each match's SQLite transaction
+	// commits (before the WAL checkpoint). The room manager wires its
+	// NotifyArchived here so retention eviction waits for the commit, not
+	// just the enqueue. It runs on the store worker; implementations must
+	// be quick and non-blocking.
+	OnArchived func(roomID string)
 }
 
 // Match is a persisted finished-match summary.
@@ -80,6 +86,10 @@ type Store struct {
 	logger     *slog.Logger
 	batchSize  int
 	flushEvery time.Duration
+	// muArchived guards onArchived: persistBatch (worker goroutine) reads it
+	// while main installs it via SetOnArchived after Open.
+	muArchived sync.RWMutex
+	onArchived func(roomID string)
 	commands   chan any
 	done       chan struct{}
 	closeOnce  sync.Once
@@ -147,11 +157,19 @@ func Open(path string, checkpointer Checkpointer, logger *slog.Logger, opts Opti
 		logger:     logger,
 		batchSize:  opts.BatchSize,
 		flushEvery: opts.FlushInterval,
+		onArchived: opts.OnArchived,
 		commands:   make(chan any, max(64, opts.BatchSize*4)),
 		done:       make(chan struct{}),
 	}
 	go s.loop()
 	return s, nil
+}
+
+// getOnArchived loads the post-commit callback under a read lock.
+func (s *Store) getOnArchived() func(roomID string) {
+	s.muArchived.RLock()
+	defer s.muArchived.RUnlock()
+	return s.onArchived
 }
 
 func migrate(db *sql.DB) error {
@@ -202,6 +220,16 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// SetOnArchived installs the post-commit callback (see Options.OnArchived).
+// It exists so main can break the manager<->store wiring cycle: the store
+// opens before the manager, and the manager needs the store as its archive
+// sink. Calls after Close are ignored.
+func (s *Store) SetOnArchived(fn func(roomID string)) {
+	s.muArchived.Lock()
+	defer s.muArchived.Unlock()
+	s.onArchived = fn
 }
 
 // MatchFinished implements room.FinishedMatchSink. It only copies the value
@@ -334,6 +362,16 @@ func (s *Store) persistBatch(batch []room.FinishedMatch) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit archive transaction: %w", err)
+	}
+
+	// The commit is what makes the match eligible for room eviction: the cold
+	// tier can now serve it after the live actor is gone. Notify before the
+	// WAL checkpoint so a checkpoint failure does not delay eviction — the
+	// retry is a no-op for SQLite and re-notifies idempotently.
+	if onArchived := s.getOnArchived(); onArchived != nil {
+		for _, match := range batch {
+			onArchived(match.RoomID)
+		}
 	}
 
 	// The transaction is durable before any WAL bytes are discarded. If a

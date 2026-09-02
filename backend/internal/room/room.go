@@ -38,6 +38,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/engine"
 )
@@ -143,8 +144,13 @@ type Snapshot struct {
 	RoomID string
 	Seq    uint64
 	Status Status
-	Turn   engine.PlayerID
-	Winner engine.PlayerID
+	// FinishedAt is the wall-clock time of the winning move as seen by the
+	// room goroutine (via the manager's injectable clock). It is zero until
+	// the match reaches StatusFinished and anchors the retention grace
+	// window: eviction requires now - FinishedAt >= retention.
+	FinishedAt time.Time
+	Turn       engine.PlayerID
+	Winner     engine.PlayerID
 	// NumPlayers and SequencesToWin are immutable match settings included so
 	// outer layers can describe a room without reaching into engine state.
 	NumPlayers     int
@@ -192,6 +198,10 @@ type Room struct {
 	logger  *slog.Logger
 	journal EventJournal
 	archive FinishedMatchSink
+	// now supplies wall-clock time for the finish timestamp. It is set by
+	// the Manager (which owns the injectable test clock) and defaults to
+	// time.Now for standalone rooms built with New.
+	now func() time.Time
 
 	cmds chan command
 	// quit is closed by Close to ask the loop to stop; done is closed by the
@@ -202,13 +212,14 @@ type Room struct {
 
 	// ---- Everything below is owned exclusively by the room goroutine. ----
 	// No other goroutine may read or write these fields.
-	gs      *engine.GameState
-	status  Status
-	seq     uint64
-	seats   []seat
-	bySeat  map[string]engine.PlayerID
-	applied map[moveKey]MoveResult
-	events  []Event
+	gs         *engine.GameState
+	status     Status
+	seq        uint64
+	seats      []seat
+	bySeat     map[string]engine.PlayerID
+	applied    map[moveKey]MoveResult
+	events     []Event
+	finishedAt time.Time
 }
 
 // New creates a room and starts its goroutine. rng seeds the match (board layout
@@ -243,6 +254,7 @@ func newRoom(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options
 		id:      id,
 		logger:  logger.With("room", id),
 		journal: journal,
+		now:     time.Now,
 		cmds:    make(chan command, mailboxSize),
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -254,6 +266,15 @@ func newRoom(id string, logger *slog.Logger, rng *rand.Rand, opts engine.Options
 		applied: make(map[moveKey]MoveResult),
 	}
 	return r, nil
+}
+
+// nowOrDefault reports the room's clock without letting a nil clock (a room
+// built by hand in a test that never went through a Manager) panic.
+func (r *Room) nowOrDefault() func() time.Time {
+	if r.now != nil {
+		return r.now
+	}
+	return time.Now
 }
 
 func (r *Room) start() { go r.loop() }
@@ -276,6 +297,13 @@ func (r *Room) loop() {
 	for {
 		select {
 		case <-r.quit:
+			// Release the per-match memory while still on the owning
+			// goroutine: after done closes no goroutine touches these
+			// fields again, so clearing here is race-free and lets the
+			// idempotency map and full event history be collected even if
+			// a caller still holds the *Room pointer.
+			r.applied = nil
+			r.events = nil
 			return
 		case c := <-r.cmds:
 			c.execute(r)
@@ -443,7 +471,11 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 	r.gs = next
 	r.seq = nextSeq
 	r.status = nextStatus
-	if r.status == StatusFinished {
+	if r.status == StatusFinished && r.finishedAt.IsZero() {
+		// Anchor the retention grace window. Guarded so a duplicate
+		// redelivery of the winning move (or a B4-era replay that appends
+		// post-terminal presence) cannot shift the eviction deadline.
+		r.finishedAt = r.nowOrDefault()()
 		r.logger.Info("match finished", "winner", r.gs.Winner, "seq", r.seq)
 	}
 	res := MoveResult{Seq: r.seq, Status: r.status, Turn: r.gs.Turn, Winner: r.gs.Winner}
@@ -506,6 +538,7 @@ func (r *Room) snapshot(viewer string) Snapshot {
 		RoomID:         r.id,
 		Seq:            r.seq,
 		Status:         r.status,
+		FinishedAt:     r.finishedAt,
 		Turn:           r.gs.Turn,
 		Winner:         r.gs.Winner,
 		NumPlayers:     r.gs.NumPlayers,

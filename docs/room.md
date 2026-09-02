@@ -140,6 +140,27 @@ caller waiting on a reply also selects on `done` (and on its own
 never blocks handing a result to a caller that has already walked away on
 context cancellation.
 
+## Retention: finished matches are evicted, not kept forever
+
+A finished match used to stay in `Manager.rooms` forever with its goroutine,
+`applied` idempotency map, and full `events` history. Now each room stamps the
+winning move with `finishedAt` (via the manager's injectable clock, defaulting
+to `time.Now`), and `Manager.Sweep` evicts a room once **both** hold:
+
+- the match reached `StatusFinished` at least `retention` ago (default `5m`,
+  via `TESSERA_ROOM_RETENTION`), so an immediate reconnect still gets the final
+  snapshot instead of a 404; and
+- the SQLite cold tier committed it (`Manager.NotifyArchived`, wired to
+  `store.Options.OnArchived` which fires after the commit, not the enqueue).
+
+Eviction unregisters the room, stops its goroutine — which nils `applied` and
+`events` on the owning goroutine before exiting — and runs the evict hook so
+transport can retire the match's hub (`Server.CloseHub`). `Sweep` is explicit
+so tests inject a fake clock and advance past the window without sleeping;
+production runs it on a ticker in `cmd/tessera`. After eviction,
+`GET /v1/matches/{id}` answers `410 match_archived` for cold-tier ids (see
+`docs/protocol.md`) and `GET /v1/matches` no longer lists the match.
+
 ## What remains outside the room layer
 
 HTTP/WebSocket concerns stay in `internal/transport`; filesystem framing and

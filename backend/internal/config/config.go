@@ -56,7 +56,22 @@ type Config struct {
 	// MUST set TESSERA_AUTH_SECRET to an unpredictable value; the process
 	// logs a warning when it falls back to the seed-derived default.
 	AuthSecret string
+	// RoomRetention is how long a finished, archived match stays live in
+	// memory before the room manager evicts it. The grace window keeps the
+	// final snapshot reachable for clients that reconnect immediately after
+	// the winning move; after eviction the match lives only in the SQLite
+	// cold tier (GET /v1/matches/{id} answers 410 match_archived).
+	// Default is DefaultRoomRetention; override with TESSERA_ROOM_RETENTION
+	// (a Go duration such as "5m").
+	RoomRetention time.Duration
 }
+
+// DefaultRoomRetention is the grace window a finished, archived match stays
+// reachable in memory before eviction. Five minutes covers an immediate
+// reconnect after the winning move without keeping every finished match's
+// goroutine, idempotency map, and event history alive for the life of the
+// process.
+const DefaultRoomRetention = 5 * time.Minute
 
 // Default returns the built-in configuration used when no environment
 // overrides are present.
@@ -70,6 +85,7 @@ func Default() Config {
 		DBPath:             "data/tessera.db",
 		StoreBatchSize:     16,
 		StoreFlushInterval: time.Second,
+		RoomRetention:      DefaultRoomRetention,
 	}
 }
 
@@ -85,6 +101,7 @@ func Default() Config {
 //	TESSERA_STORE_BATCH_SIZE -> StoreBatchSize (positive integer)
 //	TESSERA_STORE_FLUSH_INTERVAL -> StoreFlushInterval (Go duration)
 //	TESSERA_AUTH_SECRET -> AuthSecret (HMAC key for identity tokens; empty = seed-derived dev default)
+//	TESSERA_ROOM_RETENTION -> RoomRetention (Go duration, e.g. "5m")
 //
 // It returns an error rather than silently falling back so a typo in a
 // deployment env var fails loudly instead of running with a surprising value.
@@ -146,6 +163,14 @@ func Load(getenv func(string) string) (Config, error) {
 
 	if v := getenv("TESSERA_AUTH_SECRET"); v != "" {
 		cfg.AuthSecret = v
+	}
+
+	if v := getenv("TESSERA_ROOM_RETENTION"); v != "" {
+		retention, err := time.ParseDuration(v)
+		if err != nil || retention <= 0 {
+			return Config{}, fmt.Errorf("config: invalid TESSERA_ROOM_RETENTION %q (want a positive duration)", v)
+		}
+		cfg.RoomRetention = retention
 	}
 
 	return cfg, nil

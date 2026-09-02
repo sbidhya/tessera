@@ -43,7 +43,9 @@ it they are accepted but ignored.
 GET /v1/matches
 ```
 
-Returns `{"matches": [...]}` with the same summary shape as create.
+Returns `{"matches": [...]}` with the same summary shape as create. Only live
+rooms are listed: once a finished match is evicted after its retention grace
+window it disappears from this list (see below).
 
 ### Get authoritative state
 
@@ -60,6 +62,31 @@ With the B6 identity layer enabled, `player_id` must be accompanied by its
 `token` (`?player_id=...&token=...` on GET/WebSocket, `{"player_id",
 "token"}` in POST bodies). Without the layer, any `player_id` is accepted as
 before. The spectator view (no `player_id`) never needs a token.
+
+### Archived matches (retention eviction)
+
+A finished match stays live for a bounded grace window so a client that
+reconnects immediately after the winning move still gets its final snapshot.
+Once the match is both finished **and** committed to the SQLite cold tier, and
+the grace window has passed, the server evicts the room actor (goroutine,
+idempotency map, event history) and retires its WebSocket hub. The default
+grace window is **5 minutes**, configurable via `TESSERA_ROOM_RETENTION`
+(a Go duration such as `"5m"`).
+
+After eviction the match is no longer in `GET /v1/matches`, and both the state
+endpoint and the WebSocket upgrade for that id answer the clearly-coded
+archived response instead of `404 match_not_found`:
+
+```http
+GET /v1/matches/{match_id}  ->  410 Gone
+{"error": {"code": "match_archived", "message": "..."}}
+```
+
+A never-existed id still answers `404 match_not_found`; only an id the cold
+tier knows (via `store.Match`) becomes `410 match_archived`. Clients should
+treat `match_archived` as terminal — they already received the final state
+during the grace window — and must not retry it as a live match. The full
+event history remains queryable server-side via `store.History`.
 
 ## WebSocket
 
