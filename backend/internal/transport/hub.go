@@ -117,13 +117,25 @@ type matchHub struct {
 	done     chan struct{}
 	once     sync.Once
 
+	// id names the match in Server.hubs. remove deletes this hub from that
+	// directory under Server.mu (marking terminating) without stopping the
+	// loop; the loop exits itself right afterwards by returning, which closes
+	// done. remove never calls Close: Close blocks on done, so calling it from
+	// the loop would deadlock.
+	id     string
+	remove func(h *matchHub)
+	// terminating is true once the hub has been deleted from Server.hubs and
+	// is about to exit. Guarded by Server.mu: every read and write holds it,
+	// so hubFor can reject a dying hub atomically with the directory lookup.
+	terminating bool
+
 	// Owned only by loop.
 	clients  map[*wsClient]struct{}
 	byPlayer map[string]*wsClient
 	lastSeq  uint64
 }
 
-func newMatchHub(match *room.Room, logger *slog.Logger, presence *match.Presence) *matchHub {
+func newMatchHub(match *room.Room, logger *slog.Logger, presence *match.Presence, remove func(h *matchHub)) *matchHub {
 	h := &matchHub{
 		match:    match,
 		logger:   logger.With("match", match.ID()),
@@ -131,6 +143,8 @@ func newMatchHub(match *room.Room, logger *slog.Logger, presence *match.Presence
 		ops:      make(chan any, 64),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		id:       match.ID(),
+		remove:   remove,
 		clients:  make(map[*wsClient]struct{}),
 		byPlayer: make(map[string]*wsClient),
 	}
@@ -164,8 +178,34 @@ func (h *matchHub) loop() {
 			case seqOp:
 				op.reply <- h.snapshotSeq()
 			}
+			// A hub lives only while its match needs it. Once the last
+			// socket is gone and the match is finished (or its room is
+			// closed), the hub deletes itself from Server.hubs under
+			// Server.mu BEFORE exiting, so a concurrent hubFor either sees
+			// this hub while still live or finds no entry and builds a
+			// fresh one — it never observes an exited hub in the map. The
+			// delete-then-exit order is what makes the terminating flag
+			// (set inside remove) observable before done closes.
+			if len(h.clients) == 0 && h.isFinishedOrClosed() {
+				if h.remove != nil {
+					h.remove(h)
+				}
+				return
+			}
 		}
 	}
+}
+
+// isFinishedOrClosed reports whether the match no longer needs a hub: its
+// room has reached the terminal status, or the room itself is gone. Runs on
+// the hub loop; the room call blocks that loop briefly, the same price every
+// broadcast already pays.
+func (h *matchHub) isFinishedOrClosed() bool {
+	snap, err := h.match.Snapshot(context.Background(), "")
+	if err != nil {
+		return errors.Is(err, room.ErrRoomClosed)
+	}
+	return snap.Status == room.StatusFinished
 }
 
 func (h *matchHub) handleRegister(client *wsClient) error {

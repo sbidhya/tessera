@@ -187,9 +187,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "match_not_found", "match not found")
 		return
 	}
-	hub, err := s.hubFor(match)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "server_closed", err.Error())
+	// Refuse before the upgrade when the shutdown already happened, so the
+	// rejection still carries an HTTP status. The hub itself is looked up
+	// after the upgrade: creating it earlier would leave a fresh, empty hub
+	// behind every time Accept fails.
+	if s.isClosed() {
+		writeError(w, http.StatusServiceUnavailable, "server_closed", "transport server is closed")
 		return
 	}
 
@@ -201,7 +204,37 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxRequestBytes)
 	client := newWSClient(playerID, conn, s.logger.With("match", match.ID(), "player", playerID))
 
-	if err := hub.register(context.Background(), client); err != nil {
+	// A hub can retire (delete itself and exit) concurrently with this lookup:
+	// hubFor never returns an exited hub, but it can return one that retires
+	// immediately afterwards, in which case register reports ErrRoomClosed.
+	// The hub is then already gone from the directory, so one retry with a
+	// fresh hubFor carries the reconnect instead of failing it spuriously. A
+	// RoomClosed from a hub that is still registered means the room itself is
+	// gone, where retrying cannot help.
+	var hub *matchHub
+	registered := false
+	for attempt := 0; attempt < 2; attempt++ {
+		hub, err = s.hubFor(match)
+		if err != nil {
+			code := errorCode(room.ErrManagerClosed)
+			writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = wsjson.Write(writeCtx, conn, Envelope{Type: "error", Payload: errorPayload{Code: code, Message: err.Error()}})
+			cancel()
+			client.close()
+			return
+		}
+		if regErr := hub.register(context.Background(), client); regErr == nil {
+			registered = true
+			break
+		} else if errors.Is(regErr, room.ErrRoomClosed) && !s.isCurrentHub(hub) {
+			err = regErr
+			continue
+		} else {
+			err = regErr
+			break
+		}
+	}
+	if !registered {
 		code := errorCode(err)
 		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = wsjson.Write(writeCtx, conn, Envelope{Type: "error", Payload: errorPayload{Code: code, Message: err.Error()}})
@@ -260,11 +293,53 @@ func (s *Server) hubFor(match *room.Room) (*matchHub, error) {
 		return nil, errors.New("transport server is closed")
 	}
 	if h, ok := s.hubs[match.ID()]; ok {
-		return h, nil
+		// Never hand back a hub whose loop has already exited. Teardown
+		// deletes under this same lock BEFORE the loop exits, so an exited
+		// hub is normally already gone; a stale or terminating entry is
+		// dropped here and replaced below rather than returned.
+		select {
+		case <-h.done:
+			delete(s.hubs, match.ID())
+		default:
+			if h.terminating {
+				delete(s.hubs, match.ID())
+			} else {
+				return h, nil
+			}
+		}
 	}
-	h := newMatchHub(match, s.logger, s.presence)
+	h := newMatchHub(match, s.logger, s.presence, s.removeHub)
 	s.hubs[match.ID()] = h
 	return h, nil
+}
+
+// removeHub deletes h from the directory and marks it terminating, all under
+// s.mu — this is the hub's "I am terminating" signal back to the Server. It
+// never stops the hub: the hub loop calls this and then exits itself by
+// returning (which closes done). Server.Close stops hubs from outside the
+// loop instead. Neither path holds s.mu across matchHub.Close, so one wedged
+// hub cannot block every other connection's hubFor lookup — the same rule
+// Manager.Close documents for rooms.
+func (s *Server) removeHub(h *matchHub) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.hubs[h.id]; ok && cur == h {
+		h.terminating = true
+		delete(s.hubs, h.id)
+	}
+}
+
+func (s *Server) isCurrentHub(h *matchHub) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.hubs[h.id]
+	return ok && cur == h
+}
+
+func (s *Server) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // checkAuth verifies the player's token when the identity layer is enabled
