@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/sbidhya/tessera/backend/internal/engine"
 )
@@ -20,6 +21,35 @@ import (
 // tests can inject any RNG they like.
 type RandFunc func(stream string) *rand.Rand
 
+// DefaultFinishedRetention is how long an archived terminal room remains live
+// for immediate reconnects before Manager evicts it.
+const DefaultFinishedRetention = 5 * time.Minute
+
+// Timer is the stoppable timer subset Manager needs. It is public so tests and
+// embedders can provide a deterministic Clock.
+type Timer interface {
+	Stop() bool
+}
+
+// Clock schedules retention expiry. Production uses the wall clock; tests can
+// advance a fake clock without sleeping.
+type Clock interface {
+	AfterFunc(time.Duration, func()) Timer
+}
+
+type wallClock struct{}
+
+func (wallClock) AfterFunc(delay time.Duration, fn func()) Timer {
+	return time.AfterFunc(delay, fn)
+}
+
+// ManagerOptions controls room lifecycle policy. Zero values select production
+// defaults.
+type ManagerOptions struct {
+	FinishedRetention time.Duration
+	Clock             Clock
+}
+
 // Manager is the process-wide registry of live rooms.
 //
 // It uses a plain mutex, which is not a contradiction of the lock-free actor
@@ -31,17 +61,21 @@ type Manager struct {
 	randFor RandFunc
 	journal EventJournal
 	archive FinishedMatchSink
+	clock   Clock
+	retain  time.Duration
 
-	mu     sync.Mutex
-	rooms  map[string]*Room
-	ids    *rand.Rand
-	closed bool
+	mu             sync.Mutex
+	rooms          map[string]*Room
+	evictionTimers map[string]Timer
+	onEvicted      func(string)
+	ids            *rand.Rand
+	closed         bool
 }
 
 // NewManager builds an empty manager. randFor supplies each room's RNG stream,
 // so with a fixed process seed the whole set of matches is reproducible.
 func NewManager(logger *slog.Logger, randFor RandFunc) *Manager {
-	return newManager(logger, randFor, nil, nil)
+	return newManager(logger, randFor, nil, nil, ManagerOptions{})
 }
 
 // NewDurableManager builds a manager backed by journal and replays every
@@ -56,27 +90,43 @@ func NewDurableManager(logger *slog.Logger, randFor RandFunc, journal EventJourn
 // crash before SQLite was committed; the cold tier's idempotent transaction
 // makes that retry safe.
 func NewPersistentManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink) (*Manager, error) {
+	return NewPersistentManagerWithOptions(logger, randFor, journal, archive, ManagerOptions{})
+}
+
+// NewPersistentManagerWithOptions is NewPersistentManager with an injectable
+// lifecycle policy. It is used by the server for configured retention and by
+// tests for a manually advanced clock.
+func NewPersistentManagerWithOptions(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink, opts ManagerOptions) (*Manager, error) {
 	if journal == nil {
 		return nil, fmt.Errorf("room: durable manager requires an event journal")
 	}
-	m := newManager(logger, randFor, journal, archive)
+	m := newManager(logger, randFor, journal, archive, opts)
 	if err := m.recover(); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink) *Manager {
+func newManager(logger *slog.Logger, randFor RandFunc, journal EventJournal, archive FinishedMatchSink, opts ManagerOptions) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if opts.FinishedRetention <= 0 {
+		opts.FinishedRetention = DefaultFinishedRetention
+	}
+	if opts.Clock == nil {
+		opts.Clock = wallClock{}
+	}
 	return &Manager{
-		logger:  logger,
-		randFor: randFor,
-		journal: journal,
-		archive: archive,
-		rooms:   make(map[string]*Room),
-		ids:     randFor("room-ids"),
+		logger:         logger,
+		randFor:        randFor,
+		journal:        journal,
+		archive:        archive,
+		clock:          opts.Clock,
+		retain:         opts.FinishedRetention,
+		rooms:          make(map[string]*Room),
+		evictionTimers: make(map[string]Timer),
+		ids:            randFor("room-ids"),
 	}
 }
 
@@ -107,6 +157,7 @@ func (m *Manager) Create(opts engine.Options) (*Room, error) {
 		return nil, err
 	}
 	r.archive = m.archive
+	r.archived = func(finishedSeq uint64) { m.markArchived(r, finishedSeq) }
 	r.start()
 	m.rooms[id] = r
 	m.logger.Info("room created", "room", id, "players", r.gs.NumPlayers,
@@ -141,17 +192,23 @@ func (m *Manager) recover() error {
 		}
 		r.journal = m.journal
 		r.archive = m.archive
+		r.archived = func(finishedSeq uint64) { m.markArchived(r, finishedSeq) }
 		recovered = append(recovered, r)
 	}
 	for _, r := range recovered {
-		// Notify before the actor starts, while direct access to its fields is
-		// still safe. A finished WAL left behind by a crash is thereby queued for
-		// the same idempotent SQLite write as a newly completed match.
+		// Build the projection before the actor starts, while direct field access
+		// is still safe. Register and start the room before enqueueing it so even a
+		// very fast cold-tier acknowledgement can find a live actor to retain.
+		var finished *FinishedMatch
 		if r.status == StatusFinished && r.archive != nil {
-			r.archive.MatchFinished(r.finishedMatch())
+			match := r.finishedMatch()
+			finished = &match
 		}
-		r.start()
 		m.rooms[r.id] = r
+		r.start()
+		if finished != nil {
+			r.enqueueFinishedMatch(*finished)
+		}
 	}
 	if len(recovered) > 0 {
 		m.logger.Info("rooms recovered", "count", len(recovered))
@@ -266,15 +323,29 @@ func (m *Manager) List() []*Room {
 	return rooms
 }
 
+// SetEvictionHandler installs the process-local hook invoked when retention
+// evicts a room. Transport uses it to tear down the corresponding hub. The
+// handler must not call back into Manager and is run without m.mu held.
+func (m *Manager) SetEvictionHandler(handler func(string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvicted = handler
+}
+
 // Close stops one room and unregisters it.
 func (m *Manager) Close(id string) error {
 	m.mu.Lock()
 	r, ok := m.rooms[id]
 	delete(m.rooms, id)
+	timer := m.evictionTimers[id]
+	delete(m.evictionTimers, id)
 	m.mu.Unlock()
 
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrNoSuchRoom, id)
+	}
+	if timer != nil {
+		timer.Stop()
 	}
 	// Closed outside the lock: Close waits for the room's goroutine to drain,
 	// and holding the directory lock across that wait would let one slow room
@@ -294,12 +365,57 @@ func (m *Manager) Shutdown() {
 		rooms = append(rooms, r)
 	}
 	m.rooms = make(map[string]*Room)
+	timers := make([]Timer, 0, len(m.evictionTimers))
+	for _, timer := range m.evictionTimers {
+		timers = append(timers, timer)
+	}
+	m.evictionTimers = make(map[string]Timer)
 	m.mu.Unlock()
 
+	for _, timer := range timers {
+		timer.Stop()
+	}
 	for _, r := range rooms {
 		r.Close()
 	}
 	m.logger.Info("room manager shut down", "rooms_closed", len(rooms))
+}
+
+// markArchived starts the grace window only after the cold tier confirms its
+// durable write. Duplicate acknowledgements are harmless and do not extend an
+// already-running retention window.
+func (m *Manager) markArchived(r *Room, finishedSeq uint64) {
+	m.mu.Lock()
+	if m.closed || m.rooms[r.id] != r || m.evictionTimers[r.id] != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.evictionTimers[r.id] = m.clock.AfterFunc(m.retain, func() {
+		m.evictArchived(r, finishedSeq)
+	})
+	m.mu.Unlock()
+	m.logger.Info("finished room retained", "room", r.id, "seq", finishedSeq, "retention", m.retain)
+}
+
+// evictArchived removes exactly the room whose archival acknowledgement
+// scheduled this callback. Deleting under the directory lock prevents a stale
+// callback from evicting any future room that happens to reuse the same id.
+func (m *Manager) evictArchived(r *Room, finishedSeq uint64) {
+	m.mu.Lock()
+	if m.closed || m.rooms[r.id] != r {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.rooms, r.id)
+	delete(m.evictionTimers, r.id)
+	handler := m.onEvicted
+	m.mu.Unlock()
+
+	r.Close()
+	if handler != nil {
+		handler(r.id)
+	}
+	m.logger.Info("finished room evicted", "room", r.id, "seq", finishedSeq)
 }
 
 // newIDLocked mints an unused room id. Caller must hold m.mu.

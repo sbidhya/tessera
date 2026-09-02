@@ -28,19 +28,23 @@ func TestDefault(t *testing.T) {
 	if cfg.DBPath != "data/tessera.db" || cfg.StoreBatchSize != 16 || cfg.StoreFlushInterval != time.Second {
 		t.Errorf("store defaults = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
 	}
+	if cfg.FinishedMatchRetention != 5*time.Minute {
+		t.Errorf("FinishedMatchRetention = %s, want 5m", cfg.FinishedMatchRetention)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(envFunc(map[string]string{
-		"TESSERA_ADDR":                 ":9999",
-		"TESSERA_SEED":                 "42",
-		"TESSERA_LOG_LEVEL":            "debug",
-		"TESSERA_WAL_DIR":              "/tmp/tessera-wal",
-		"TESSERA_WAL_SYNC":             "never",
-		"TESSERA_DB_PATH":              "/tmp/tessera.db",
-		"TESSERA_STORE_BATCH_SIZE":     "8",
-		"TESSERA_STORE_FLUSH_INTERVAL": "250ms",
-		"TESSERA_AUTH_SECRET":          "s3cr3t",
+		"TESSERA_ADDR":                     ":9999",
+		"TESSERA_SEED":                     "42",
+		"TESSERA_LOG_LEVEL":                "debug",
+		"TESSERA_WAL_DIR":                  "/tmp/tessera-wal",
+		"TESSERA_WAL_SYNC":                 "never",
+		"TESSERA_DB_PATH":                  "/tmp/tessera.db",
+		"TESSERA_STORE_BATCH_SIZE":         "8",
+		"TESSERA_STORE_FLUSH_INTERVAL":     "250ms",
+		"TESSERA_FINISHED_MATCH_RETENTION": "3m",
+		"TESSERA_AUTH_SECRET":              "s3cr3t",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -59,6 +63,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.DBPath != "/tmp/tessera.db" || cfg.StoreBatchSize != 8 || cfg.StoreFlushInterval != 250*time.Millisecond {
 		t.Errorf("store config = %q/%d/%s", cfg.DBPath, cfg.StoreBatchSize, cfg.StoreFlushInterval)
+	}
+	if cfg.FinishedMatchRetention != 3*time.Minute {
+		t.Errorf("FinishedMatchRetention = %s, want 3m", cfg.FinishedMatchRetention)
 	}
 	if cfg.AuthSecret != "s3cr3t" {
 		t.Errorf("AuthSecret = %q, want s3cr3t", cfg.AuthSecret)
@@ -111,8 +118,9 @@ func TestLoadInvalidWALSync(t *testing.T) {
 
 func TestLoadInvalidStoreConfig(t *testing.T) {
 	for key, value := range map[string]string{
-		"TESSERA_STORE_BATCH_SIZE":     "0",
-		"TESSERA_STORE_FLUSH_INTERVAL": "soon",
+		"TESSERA_STORE_BATCH_SIZE":         "0",
+		"TESSERA_STORE_FLUSH_INTERVAL":     "soon",
+		"TESSERA_FINISHED_MATCH_RETENTION": "0s",
 	} {
 		t.Run(key, func(t *testing.T) {
 			if _, err := Load(envFunc(map[string]string{key: value})); err == nil {

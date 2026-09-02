@@ -21,7 +21,7 @@ type captureArchive struct {
 	matches chan FinishedMatch
 }
 
-func (a *captureArchive) MatchFinished(match FinishedMatch) {
+func (a *captureArchive) MatchFinished(match FinishedMatch, _ func()) {
 	a.matches <- match
 }
 

@@ -48,6 +48,9 @@ type Config struct {
 	StoreBatchSize int
 	// StoreFlushInterval bounds how long a partial write-behind batch waits.
 	StoreFlushInterval time.Duration
+	// FinishedMatchRetention is the reconnect grace window between cold-tier
+	// archival and eviction of the live room actor.
+	FinishedMatchRetention time.Duration
 	// AuthSecret is the HMAC key that signs anonymous identity tokens
 	// (internal/auth). Empty selects the deterministic dev default: a
 	// 32-byte value drawn from the "auth-secret" RNG stream, so the same
@@ -62,14 +65,15 @@ type Config struct {
 // overrides are present.
 func Default() Config {
 	return Config{
-		Addr:               ":8080",
-		Seed:               1,
-		LogLevel:           slog.LevelInfo,
-		WALDir:             "data/wal",
-		WALSync:            "always",
-		DBPath:             "data/tessera.db",
-		StoreBatchSize:     16,
-		StoreFlushInterval: time.Second,
+		Addr:                   ":8080",
+		Seed:                   1,
+		LogLevel:               slog.LevelInfo,
+		WALDir:                 "data/wal",
+		WALSync:                "always",
+		DBPath:                 "data/tessera.db",
+		StoreBatchSize:         16,
+		StoreFlushInterval:     time.Second,
+		FinishedMatchRetention: 5 * time.Minute,
 	}
 }
 
@@ -84,6 +88,7 @@ func Default() Config {
 //	TESSERA_DB_PATH    -> DBPath     (SQLite file path)
 //	TESSERA_STORE_BATCH_SIZE -> StoreBatchSize (positive integer)
 //	TESSERA_STORE_FLUSH_INTERVAL -> StoreFlushInterval (Go duration)
+//	TESSERA_FINISHED_MATCH_RETENTION -> FinishedMatchRetention (positive Go duration)
 //	TESSERA_AUTH_SECRET -> AuthSecret (HMAC key for identity tokens; empty = seed-derived dev default)
 //
 // It returns an error rather than silently falling back so a typo in a
@@ -142,6 +147,14 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("config: invalid TESSERA_STORE_FLUSH_INTERVAL %q (want a positive duration)", v)
 		}
 		cfg.StoreFlushInterval = interval
+	}
+
+	if v := getenv("TESSERA_FINISHED_MATCH_RETENTION"); v != "" {
+		retention, err := time.ParseDuration(v)
+		if err != nil || retention <= 0 {
+			return Config{}, fmt.Errorf("config: invalid TESSERA_FINISHED_MATCH_RETENTION %q (want a positive duration)", v)
+		}
+		cfg.FinishedMatchRetention = retention
 	}
 
 	if v := getenv("TESSERA_AUTH_SECRET"); v != "" {

@@ -27,6 +27,12 @@ type testBackend struct {
 	http    *httptest.Server
 }
 
+type archiveLookup map[string]bool
+
+func (a archiveLookup) HasMatch(_ context.Context, id string) (bool, error) {
+	return a[id], nil
+}
+
 func newTestBackend(t *testing.T, seed int64) *testBackend {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -124,6 +130,38 @@ func TestRESTValidationAndNotFound(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("missing match status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestRESTArchivedMatchIsDistinctFromMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{Seed: 1}
+	manager := room.NewManager(logger, cfg.NewRand)
+	api := NewWithDeps(manager, logger, Deps{Archive: archiveLookup{"r_archived": true}})
+	t.Cleanup(func() {
+		api.Close()
+		manager.Shutdown()
+	})
+
+	for id, wantStatus := range map[string]int{
+		"r_archived": http.StatusGone,
+		"r_missing":  http.StatusNotFound,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/matches/"+id, nil)
+		response := httptest.NewRecorder()
+		api.Handler().ServeHTTP(response, req)
+		if response.Code != wantStatus {
+			t.Errorf("GET %s status = %d, want %d", id, response.Code, wantStatus)
+		}
+		var body errorResponse
+		decodeResponse(t, response.Result(), &body)
+		wantCode := "match_not_found"
+		if id == "r_archived" {
+			wantCode = "match_archived"
+		}
+		if body.Error.Code != wantCode {
+			t.Errorf("GET %s code = %q, want %q", id, body.Error.Code, wantCode)
+		}
 	}
 }
 

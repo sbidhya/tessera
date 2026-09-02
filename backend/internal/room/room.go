@@ -192,6 +192,10 @@ type Room struct {
 	logger  *slog.Logger
 	journal EventJournal
 	archive FinishedMatchSink
+	// archived is installed by Manager before the actor starts. The cold tier
+	// invokes it after a terminal match is durable, making the room eligible for
+	// retention-based eviction.
+	archived func(finishedSeq uint64)
 
 	cmds chan command
 	// quit is closed by Close to ask the loop to stop; done is closed by the
@@ -272,7 +276,15 @@ func (r *Room) Close() {
 // loop is the room's single owning goroutine: the only code allowed to touch
 // the fields below the ownership line in Room.
 func (r *Room) loop() {
-	defer close(r.done)
+	defer func() {
+		// A Room can remain referenced briefly by an in-flight caller or a retired
+		// transport hub after its actor exits. Release the two match-sized history
+		// structures here instead of relying on the Room itself becoming
+		// unreachable.
+		r.applied = nil
+		r.events = nil
+		close(r.done)
+	}()
 	for {
 		select {
 		case <-r.quit:
@@ -453,7 +465,7 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 	// bounded by the deck; no eviction is needed at this scale.
 	r.applied[key] = res
 	if r.status == StatusFinished && r.archive != nil {
-		r.archive.MatchFinished(r.finishedMatch())
+		r.enqueueArchive()
 	}
 	return res, nil
 }
@@ -578,6 +590,22 @@ func (r *Room) finishedMatch() FinishedMatch {
 		Players:        players,
 		History:        slices.Clone(r.events),
 	}
+}
+
+// enqueueArchive hands a terminal projection to the cold tier and connects its
+// eventual durability acknowledgement back to Manager. It runs only on the
+// actor (or during single-threaded recovery), so building the projection is
+// race-free; the callback touches only Manager-owned state.
+func (r *Room) enqueueArchive() {
+	r.enqueueFinishedMatch(r.finishedMatch())
+}
+
+func (r *Room) enqueueFinishedMatch(match FinishedMatch) {
+	r.archive.MatchFinished(match, func() {
+		if r.archived != nil {
+			r.archived(match.FinishedSeq)
+		}
+	})
 }
 
 // replayFinishedPresence accepts B4-era WALs that recorded socket presence

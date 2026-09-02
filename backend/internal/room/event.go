@@ -78,8 +78,12 @@ type FinishedMatch struct {
 // the room actor after the terminal state is committed but before its caller is
 // acknowledged. The WAL remains the recovery source until the sink later
 // checkpoints it, so enqueueing does not need to synchronously touch SQLite.
+// archived must be called exactly once after the match is durably stored. It is
+// deliberately a callback rather than a blocking result so disk I/O never runs
+// on the room actor. WAL checkpointing may follow independently; the cold-tier
+// record is already sufficient for eviction once archived runs.
 type FinishedMatchSink interface {
-	MatchFinished(FinishedMatch)
+	MatchFinished(match FinishedMatch, archived func())
 }
 
 func createdEvent(id string, opts engine.Options, seed [2]uint64) Event {
