@@ -234,6 +234,58 @@ func TestWebSocketFullGameReconnect(t *testing.T) {
 	t.Logf("winner=%d moves=%d final_seq=%d", *states[0].state.Winner, moveNumber, states[0].seq)
 }
 
+func TestFinishedMatchHubRetiresAfterLastDisconnect(t *testing.T) {
+	b := newTestBackend(t, 11)
+	matchID := createMatch(t, b.http.URL, 1).Match.ID
+
+	alice := dialPlayer(t, b.http.URL, matchID, "alice")
+	bob := dialPlayer(t, b.http.URL, matchID, "bob")
+	states := map[int]observedState{
+		0: readStateAtLeast(t, alice, 3),
+		1: readStateAtLeast(t, bob, 3),
+	}
+	clients := map[int]*websocket.Conn{0: alice, 1: bob}
+
+	for moveNumber := 0; states[0].state.Status != "finished"; moveNumber++ {
+		if moveNumber > 5000 {
+			t.Fatal("match did not finish in 5000 moves")
+		}
+		turn := states[0].state.Turn
+		current := states[turn]
+		payload, ok := chooseWireMove(current.state, fmt.Sprintf("retire-%d", moveNumber))
+		if !ok {
+			t.Fatalf("seat %d has no legal move at seq %d", turn, current.seq)
+		}
+		writeMessage(t, clients[turn], Envelope{Type: "move", Seq: current.seq, Payload: payload})
+		nextSeq := current.seq + 1
+		states[0] = readStateAtLeast(t, alice, nextSeq)
+		states[1] = readStateAtLeast(t, bob, nextSeq)
+	}
+
+	b.api.mu.Lock()
+	hub := b.api.hubs[matchID]
+	b.api.mu.Unlock()
+	if hub == nil {
+		t.Fatal("finished match has no hub before clients disconnect")
+	}
+
+	_ = alice.CloseNow()
+	_ = bob.CloseNow()
+
+	select {
+	case <-hub.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub goroutine did not exit after the last client disconnected")
+	}
+
+	b.api.mu.Lock()
+	hubCount := len(b.api.hubs)
+	b.api.mu.Unlock()
+	if hubCount != 0 {
+		t.Fatalf("server retains %d hubs after the finished match disconnected, want 0", hubCount)
+	}
+}
+
 type observedState struct {
 	seq   uint64
 	state State

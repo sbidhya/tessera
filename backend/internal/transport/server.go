@@ -201,7 +201,20 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxRequestBytes)
 	client := newWSClient(playerID, conn, s.logger.With("match", match.ID(), "player", playerID))
 
-	if err := hub.register(context.Background(), client); err != nil {
+	// The hub may have become terminal and empty after hubFor returned but
+	// before this upgraded socket could register. Its directory entry is gone
+	// before its loop exits, so retrying resolves to a fresh, live hub.
+	for {
+		err = hub.register(context.Background(), client)
+		if !errors.Is(err, errHubClosed) {
+			break
+		}
+		hub, err = s.hubFor(match)
+		if err != nil {
+			break
+		}
+	}
+	if err != nil {
 		code := errorCode(err)
 		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = wsjson.Write(writeCtx, conn, Envelope{Type: "error", Payload: errorPayload{Code: code, Message: err.Error()}})
@@ -262,9 +275,21 @@ func (s *Server) hubFor(match *room.Room) (*matchHub, error) {
 	if h, ok := s.hubs[match.ID()]; ok {
 		return h, nil
 	}
-	h := newMatchHub(match, s.logger, s.presence)
+	h := newMatchHub(match, s.logger, s.presence, s.retireHub)
 	s.hubs[match.ID()] = h
 	return h, nil
+}
+
+// retireHub removes h before its loop exits. hubFor and this callback serialize
+// on s.mu, so a lookup can return either this still-live hub or its replacement,
+// never the already-stopped instance. Waiting for the loop belongs outside the
+// server lock (as in Close); this callback deliberately does not call h.Close.
+func (s *Server) retireHub(h *matchHub) {
+	s.mu.Lock()
+	if s.hubs[h.match.ID()] == h {
+		delete(s.hubs, h.match.ID())
+	}
+	s.mu.Unlock()
 }
 
 // checkAuth verifies the player's token when the identity layer is enabled
