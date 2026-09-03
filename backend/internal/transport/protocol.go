@@ -197,7 +197,7 @@ type errorResponse struct {
 func stateFromSnapshot(s room.Snapshot) State {
 	state := State{
 		MatchID:        s.RoomID,
-		Status:         s.Status.String(),
+		Status:         wireStatus(s.Status, s.Winner),
 		NumPlayers:     s.NumPlayers,
 		SequencesToWin: s.SequencesToWin,
 		Turn:           int(s.Turn),
@@ -273,12 +273,21 @@ func summaryFromSnapshot(s room.Snapshot) MatchSummary {
 	return MatchSummary{
 		ID:             s.RoomID,
 		Seq:            s.Seq,
-		Status:         s.Status.String(),
+		Status:         wireStatus(s.Status, s.Winner),
 		Players:        len(s.Players),
 		Present:        present,
 		Capacity:       s.NumPlayers,
 		SequencesToWin: s.SequencesToWin,
 	}
+}
+
+// wireStatus keeps the room's lifecycle compact (both wins and draws are
+// finished) while giving clients an unambiguous terminal draw value.
+func wireStatus(status room.Status, winner engine.PlayerID) string {
+	if status == room.StatusFinished && winner == engine.NoPlayer {
+		return "drawn"
+	}
+	return status.String()
 }
 
 func cardFromEngine(c engine.Card) Card {

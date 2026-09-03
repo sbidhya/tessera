@@ -54,10 +54,13 @@ type Match struct {
 	FinishedSeq    uint64
 	NumPlayers     int
 	SequencesToWin int
-	WinnerID       string
-	WinnerSeat     engine.PlayerID
-	MoveCount      int
-	ArchivedAt     time.Time
+	// WinnerID is empty and WinnerSeat is engine.NoPlayer for a draw. The
+	// corresponding database columns are NULL so a draw is not confused with a
+	// player whose id happens to be empty or seat zero.
+	WinnerID   string
+	WinnerSeat engine.PlayerID
+	MoveCount  int
+	ArchivedAt time.Time
 }
 
 // PlayerStats is the aggregate result row for one player.
@@ -162,11 +165,21 @@ func Open(path string, checkpointer Checkpointer, logger *slog.Logger, opts Opti
 }
 
 func migrate(db *sql.DB) error {
-	statements := []string{
+	settings := []string{
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA busy_timeout = 5000`,
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA synchronous = FULL`,
+	}
+	for _, statement := range settings {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("store: configure SQLite: %w", err)
+		}
+	}
+
+	// This is the original schema. Keep it intact so an existing unversioned
+	// database and a new database both take the same explicit migration below.
+	statements := []string{
 		`CREATE TABLE IF NOT EXISTS matches (
 			id TEXT PRIMARY KEY,
 			finished_seq INTEGER NOT NULL,
@@ -207,6 +220,90 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("store: migrate SQLite: %w", err)
 		}
+	}
+	return migrateNullableWinner(db)
+}
+
+// migrateNullableWinner rebuilds the original matches table so drawn matches
+// can store SQL NULL for both winner columns. SQLite cannot remove a NOT NULL
+// constraint with ALTER COLUMN, so this follows its documented table-rebuild
+// migration procedure while preserving rows and dependent foreign keys.
+func migrateNullableWinner(db *sql.DB) (err error) {
+	rows, err := db.Query(`PRAGMA table_info(matches)`)
+	if err != nil {
+		return fmt.Errorf("store: inspect matches schema: %w", err)
+	}
+	needsMigration := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: inspect matches column: %w", err)
+		}
+		if (name == "winner_player_id" || name == "winner_seat") && notNull != 0 {
+			needsMigration = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: inspect matches schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: inspect matches schema: %w", err)
+	}
+	if !needsMigration {
+		return nil
+	}
+
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("store: disable foreign keys for winner migration: %w", err)
+	}
+	defer func() {
+		if _, enableErr := db.Exec(`PRAGMA foreign_keys = ON`); err == nil && enableErr != nil {
+			err = fmt.Errorf("store: re-enable foreign keys after winner migration: %w", enableErr)
+		}
+	}()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin winner migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, statement := range []string{
+		`CREATE TABLE matches_with_nullable_winner (
+			id TEXT PRIMARY KEY,
+			finished_seq INTEGER NOT NULL,
+			num_players INTEGER NOT NULL,
+			sequences_to_win INTEGER NOT NULL,
+			winner_player_id TEXT,
+			winner_seat INTEGER,
+			move_count INTEGER NOT NULL,
+			archive_hash BLOB NOT NULL,
+			archived_at TEXT NOT NULL,
+			CHECK ((winner_player_id IS NULL) = (winner_seat IS NULL))
+		)`,
+		`INSERT INTO matches_with_nullable_winner
+			SELECT id, finished_seq, num_players, sequences_to_win, winner_player_id,
+				winner_seat, move_count, archive_hash, archived_at FROM matches`,
+		`DROP TABLE matches`,
+		`ALTER TABLE matches_with_nullable_winner RENAME TO matches`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("store: migrate nullable match winner: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit nullable winner migration: %w", err)
+	}
+
+	var violations int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil {
+		return fmt.Errorf("store: verify winner migration foreign keys: %w", err)
+	}
+	if violations != 0 {
+		return fmt.Errorf("store: winner migration introduced %d foreign key violations", violations)
 	}
 	return nil
 }
@@ -376,7 +473,7 @@ func (s *Store) persistBatch(batch []room.FinishedMatch, committed func()) error
 }
 
 func archiveMatch(tx *sql.Tx, match room.FinishedMatch, archivedAt string) error {
-	winnerID, moveCount, err := validateMatch(match)
+	winnerID, hasWinner, moveCount, err := validateMatch(match)
 	if err != nil {
 		return err
 	}
@@ -388,11 +485,16 @@ func archiveMatch(tx *sql.Tx, match room.FinishedMatch, archivedAt string) error
 		return err
 	}
 
+	var winnerIDValue, winnerSeatValue any
+	if hasWinner {
+		winnerIDValue = winnerID
+		winnerSeatValue = int(match.Winner)
+	}
 	result, err := tx.Exec(`INSERT OR IGNORE INTO matches
 		(id, finished_seq, num_players, sequences_to_win, winner_player_id, winner_seat, move_count, archive_hash, archived_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		match.RoomID, int64(match.FinishedSeq), match.NumPlayers, match.SequencesToWin,
-		winnerID, int(match.Winner), moveCount, hash, archivedAt)
+		winnerIDValue, winnerSeatValue, moveCount, hash, archivedAt)
 	if err != nil {
 		return fmt.Errorf("store: insert match %s: %w", match.RoomID, err)
 	}
@@ -401,14 +503,16 @@ func archiveMatch(tx *sql.Tx, match room.FinishedMatch, archivedAt string) error
 		return fmt.Errorf("store: inspect match insert %s: %w", match.RoomID, err)
 	}
 	if inserted == 0 {
-		return verifyExisting(tx, match, winnerID, moveCount, hash)
+		return verifyExisting(tx, match, winnerID, hasWinner, moveCount, hash)
 	}
 
 	for _, player := range match.Players {
 		won := 0
-		wins, losses := 0, 1
+		wins, losses := 0, 0
 		if player.Won {
 			won, wins, losses = 1, 1, 0
+		} else if hasWinner {
+			losses = 1
 		}
 		if _, err := tx.Exec(`INSERT INTO match_players
 			(match_id, player_id, seat, won, sequences_completed) VALUES (?, ?, ?, ?, ?)`,
@@ -442,19 +546,19 @@ func archiveMatch(tx *sql.Tx, match room.FinishedMatch, archivedAt string) error
 	return nil
 }
 
-func validateMatch(match room.FinishedMatch) (winnerID string, moveCount int, err error) {
+func validateMatch(match room.FinishedMatch) (winnerID string, hasWinner bool, moveCount int, err error) {
 	if match.RoomID == "" || match.FinishedSeq == 0 {
-		return "", 0, errors.New("store: finished match has incomplete identity")
+		return "", false, 0, errors.New("store: finished match has incomplete identity")
 	}
 	if match.NumPlayers < 2 || len(match.Players) != match.NumPlayers {
-		return "", 0, fmt.Errorf("store: match %s has %d players, want %d", match.RoomID, len(match.Players), match.NumPlayers)
+		return "", false, 0, fmt.Errorf("store: match %s has %d players, want %d", match.RoomID, len(match.Players), match.NumPlayers)
 	}
 	if match.SequencesToWin < 1 {
-		return "", 0, fmt.Errorf("store: match %s has invalid sequences_to_win", match.RoomID)
+		return "", false, 0, fmt.Errorf("store: match %s has invalid sequences_to_win", match.RoomID)
 	}
 	if len(match.History) == 0 || match.History[0].Type != room.EventRoomCreated ||
 		match.History[len(match.History)-1].Seq != match.FinishedSeq {
-		return "", 0, fmt.Errorf("store: match %s has incomplete history", match.RoomID)
+		return "", false, 0, fmt.Errorf("store: match %s has incomplete history", match.RoomID)
 	}
 
 	seenPlayers := make(map[string]struct{}, len(match.Players))
@@ -462,13 +566,13 @@ func validateMatch(match room.FinishedMatch) (winnerID string, moveCount int, er
 	winners := 0
 	for _, player := range match.Players {
 		if player.ID == "" || player.Seat < 0 || int(player.Seat) >= match.NumPlayers {
-			return "", 0, fmt.Errorf("store: match %s has invalid player result", match.RoomID)
+			return "", false, 0, fmt.Errorf("store: match %s has invalid player result", match.RoomID)
 		}
 		if _, ok := seenPlayers[player.ID]; ok {
-			return "", 0, fmt.Errorf("store: match %s repeats player %s", match.RoomID, player.ID)
+			return "", false, 0, fmt.Errorf("store: match %s repeats player %s", match.RoomID, player.ID)
 		}
 		if _, ok := seenSeats[player.Seat]; ok {
-			return "", 0, fmt.Errorf("store: match %s repeats seat %d", match.RoomID, player.Seat)
+			return "", false, 0, fmt.Errorf("store: match %s repeats seat %d", match.RoomID, player.Seat)
 		}
 		seenPlayers[player.ID] = struct{}{}
 		seenSeats[player.Seat] = struct{}{}
@@ -476,25 +580,29 @@ func validateMatch(match room.FinishedMatch) (winnerID string, moveCount int, er
 			winners++
 			winnerID = player.ID
 			if player.Seat != match.Winner {
-				return "", 0, fmt.Errorf("store: match %s winner seat disagrees with player result", match.RoomID)
+				return "", false, 0, fmt.Errorf("store: match %s winner seat disagrees with player result", match.RoomID)
 			}
 		}
 	}
-	if winners != 1 {
-		return "", 0, fmt.Errorf("store: match %s has %d winners", match.RoomID, winners)
+	if winners > 1 {
+		return "", false, 0, fmt.Errorf("store: match %s has %d winners", match.RoomID, winners)
+	}
+	hasWinner = winners == 1
+	if !hasWinner && match.Winner != engine.NoPlayer {
+		return "", false, 0, fmt.Errorf("store: match %s has no winning player but winner seat is %d", match.RoomID, match.Winner)
 	}
 
 	var previous uint64
 	for _, event := range match.History {
 		if event.RoomID != match.RoomID || event.Seq != previous+1 {
-			return "", 0, fmt.Errorf("store: match %s history is not contiguous at sequence %d", match.RoomID, event.Seq)
+			return "", false, 0, fmt.Errorf("store: match %s history is not contiguous at sequence %d", match.RoomID, event.Seq)
 		}
 		previous = event.Seq
 		if event.Type == room.EventMoveApplied {
 			moveCount++
 		}
 	}
-	return winnerID, moveCount, nil
+	return winnerID, hasWinner, moveCount, nil
 }
 
 func archiveHash(match room.FinishedMatch) ([]byte, error) {
@@ -506,10 +614,11 @@ func archiveHash(match room.FinishedMatch) ([]byte, error) {
 	return sum[:], nil
 }
 
-func verifyExisting(tx *sql.Tx, match room.FinishedMatch, winnerID string, moveCount int, hash []byte) error {
+func verifyExisting(tx *sql.Tx, match room.FinishedMatch, winnerID string, hasWinner bool, moveCount int, hash []byte) error {
 	var seq int64
-	var players, sequences, winnerSeat, moves int
-	var storedWinner string
+	var players, sequences, moves int
+	var storedWinner sql.NullString
+	var winnerSeat sql.NullInt64
 	var storedHash []byte
 	err := tx.QueryRow(`SELECT finished_seq, num_players, sequences_to_win,
 		winner_player_id, winner_seat, move_count, archive_hash FROM matches WHERE id = ?`, match.RoomID).
@@ -517,8 +626,12 @@ func verifyExisting(tx *sql.Tx, match room.FinishedMatch, winnerID string, moveC
 	if err != nil {
 		return fmt.Errorf("store: verify existing match %s: %w", match.RoomID, err)
 	}
+	winnerMatches := storedWinner.Valid == hasWinner && winnerSeat.Valid == hasWinner
+	if hasWinner {
+		winnerMatches = winnerMatches && storedWinner.String == winnerID && winnerSeat.Int64 == int64(match.Winner)
+	}
 	if seq != int64(match.FinishedSeq) || players != match.NumPlayers || sequences != match.SequencesToWin ||
-		storedWinner != winnerID || winnerSeat != int(match.Winner) || moves != moveCount || !bytes.Equal(storedHash, hash) {
+		!winnerMatches || moves != moveCount || !bytes.Equal(storedHash, hash) {
 		return fmt.Errorf("store: archived match %s conflicts with WAL result", match.RoomID)
 	}
 	return nil
@@ -528,17 +641,22 @@ func verifyExisting(tx *sql.Tx, match room.FinishedMatch, winnerID string, moveC
 func (s *Store) Match(ctx context.Context, id string) (Match, error) {
 	var result Match
 	var seq int64
-	var seat int
+	var winnerID sql.NullString
+	var seat sql.NullInt64
 	var archived string
 	err := s.db.QueryRowContext(ctx, `SELECT id, finished_seq, num_players, sequences_to_win,
 		winner_player_id, winner_seat, move_count, archived_at FROM matches WHERE id = ?`, id).
 		Scan(&result.ID, &seq, &result.NumPlayers, &result.SequencesToWin,
-			&result.WinnerID, &seat, &result.MoveCount, &archived)
+			&winnerID, &seat, &result.MoveCount, &archived)
 	if err != nil {
 		return Match{}, err
 	}
 	result.FinishedSeq = uint64(seq)
-	result.WinnerSeat = engine.PlayerID(seat)
+	result.WinnerSeat = engine.NoPlayer
+	if winnerID.Valid && seat.Valid {
+		result.WinnerID = winnerID.String
+		result.WinnerSeat = engine.PlayerID(seat.Int64)
+	}
 	result.ArchivedAt, err = time.Parse(time.RFC3339Nano, archived)
 	if err != nil {
 		return Match{}, fmt.Errorf("store: parse archived time for %s: %w", id, err)

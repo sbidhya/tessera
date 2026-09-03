@@ -114,6 +114,93 @@ func TestCrashBetweenWALAndSQLiteRecovers(t *testing.T) {
 	}
 }
 
+// TestDrawnRoomIsArchivedAndCheckpointed drives a room through the same public
+// API used by transport until the deck-exhaustion rule ends it. This is the
+// cross-layer regression gate: the room must publish StatusFinished, the cold
+// tier must accept its zero-winner result, and only then may the WAL disappear.
+func TestDrawnRoomIsArchivedAndCheckpointed(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	journal, err := wal.Open(walDir, wal.SyncAlways)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	cold, err := store.Open(filepath.Join(dir, "tessera.db"), journal, quietLogger(),
+		store.Options{BatchSize: 8, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatalf("open SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Close() })
+	cfg := config.Config{Seed: 1}
+	manager, err := room.NewPersistentManager(quietLogger(), cfg.NewRand, journal, cold)
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+	t.Cleanup(manager.Shutdown)
+
+	match, err := manager.Create(engine.Options{NumPlayers: 2, SequencesToWin: 999})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	for _, player := range []string{"alice", "bob"} {
+		if _, err := match.Join(t.Context(), player); err != nil {
+			t.Fatalf("join %s: %v", player, err)
+		}
+	}
+
+	players := []string{"alice", "bob"}
+	for move := 0; move < 500; move++ {
+		spectator, err := match.Snapshot(t.Context(), "")
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if spectator.Status == room.StatusFinished {
+			break
+		}
+		player := players[spectator.Turn]
+		snapshot, err := match.Snapshot(t.Context(), player)
+		if err != nil {
+			t.Fatalf("snapshot %s: %v", player, err)
+		}
+		request, ok := chooseMove(snapshot)
+		if !ok {
+			t.Fatalf("no move for %s with %d draw cards remaining", player, snapshot.DrawRemaining)
+		}
+		request.PlayerID = player
+		request.MoveID = fmt.Sprintf("draw-%d", move)
+		if _, err := match.PlayMove(t.Context(), request); err != nil {
+			t.Fatalf("move %d: %v", move, err)
+		}
+	}
+
+	final, err := match.Snapshot(t.Context(), "")
+	if err != nil {
+		t.Fatalf("final snapshot: %v", err)
+	}
+	if final.Status != room.StatusFinished || final.Winner != engine.NoPlayer || final.DrawRemaining != 0 {
+		t.Fatalf("final state = status %s winner %d draw %d, want finished draw",
+			final.Status, final.Winner, final.DrawRemaining)
+	}
+	walPath := filepath.Join(walDir, match.ID()+".wal")
+	if _, err := os.Stat(walPath); err != nil {
+		t.Fatalf("terminal WAL before archive: %v", err)
+	}
+	if err := cold.Flush(t.Context()); err != nil {
+		t.Fatalf("flush draw: %v", err)
+	}
+	record, err := cold.Match(t.Context(), match.ID())
+	if err != nil {
+		t.Fatalf("archived draw: %v", err)
+	}
+	if record.WinnerID != "" || record.WinnerSeat != engine.NoPlayer {
+		t.Errorf("archived winner = %q/%d, want draw", record.WinnerID, record.WinnerSeat)
+	}
+	if _, err := os.Stat(walPath); !os.IsNotExist(err) {
+		t.Errorf("checkpointed draw WAL stat = %v, want not-exist", err)
+	}
+}
+
 func TestStoreCrashWriterProcess(t *testing.T) {
 	if os.Getenv(coldCrashHelperEnv) != "1" {
 		return

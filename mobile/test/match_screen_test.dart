@@ -104,4 +104,16 @@ void main() {
     expect(calls, 2);
     expect(find.text('#9'), findsOneWidget);
   });
+
+  testWidgets('renders a drawn match without requiring a winner', (
+    tester,
+  ) async {
+    await pumpMatch(
+      tester,
+      MockClient((request) async => matchSnapshotResponse(status: 'drawn')),
+    );
+
+    expect(find.text('Match drawn'), findsOneWidget);
+    expect(find.byIcon(Icons.handshake), findsOneWidget);
+  });
 }

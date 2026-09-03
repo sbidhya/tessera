@@ -55,4 +55,11 @@ void main() {
 
     expect(() => MatchSnapshot.fromJson(json), throwsFormatException);
   });
+
+  test('accepts a drawn terminal state without a winner', () {
+    final snapshot = MatchSnapshot.fromJson(matchSnapshotJson(status: 'drawn'));
+
+    expect(snapshot.state.status, 'drawn');
+    expect(snapshot.state.winner, isNull);
+  });
 }

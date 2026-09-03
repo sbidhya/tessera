@@ -265,7 +265,7 @@ func (h *matchHub) handleMove(client *wsClient, request room.MoveRequest) moveOu
 			MoveID:    request.MoveID,
 			PlayerID:  request.PlayerID,
 			Duplicate: result.Duplicate,
-			Status:    result.Status.String(),
+			Status:    wireStatus(result.Status, result.Winner),
 			Turn:      int(result.Turn),
 			Winner:    optionalPlayer(result.Winner),
 		},

@@ -6,6 +6,8 @@ Map<String, Object?> matchSnapshotJson({
   String matchId = 'r_board',
   int seq = 8,
   bool spectator = false,
+  String status = 'playing',
+  int? winner,
 }) {
   final board = <Map<String, Object?>>[];
   for (var row = 0; row < 10; row++) {
@@ -28,11 +30,11 @@ Map<String, Object?> matchSnapshotJson({
     'seq': seq,
     'state': {
       'match_id': matchId,
-      'status': 'playing',
+      'status': status,
       'num_players': 2,
       'sequences_to_win': 2,
       'turn': 0,
-      'winner': null,
+      'winner': winner,
       'viewer': spectator ? null : 0,
       'hand': spectator
           ? <Object>[]
@@ -75,10 +77,18 @@ http.Response matchSnapshotResponse({
   String matchId = 'r_board',
   int seq = 8,
   bool spectator = false,
+  String status = 'playing',
+  int? winner,
   int statusCode = 200,
 }) => http.Response(
   jsonEncode(
-    matchSnapshotJson(matchId: matchId, seq: seq, spectator: spectator),
+    matchSnapshotJson(
+      matchId: matchId,
+      seq: seq,
+      spectator: spectator,
+      status: status,
+      winner: winner,
+    ),
   ),
   statusCode,
   headers: const {'content-type': 'application/json'},

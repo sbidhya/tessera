@@ -56,6 +56,11 @@ their own `hand`; an omitted or unknown id gets a spectator view with an empty
 hand. Every view contains public board cells, chips, sequence lines, per-seat
 hand counts, turn, winner, players/presence, and remaining draw count.
 
+`status` is `waiting`, `playing`, `finished`, or `drawn`. `finished` means a
+player won and therefore carries a non-null `winner`; `drawn` is the terminal
+deck-exhaustion result and carries `winner: null`. The room lifecycle treats
+both terminal values as finished for archival and retention.
+
 With the B6 identity layer enabled, `player_id` must be accompanied by its
 `token` (`?player_id=...&token=...` on GET/WebSocket, `{"player_id",
 "token"}` in POST bodies). Without the layer, any `player_id` is accepted as

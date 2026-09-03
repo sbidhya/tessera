@@ -56,7 +56,7 @@ const (
 	StatusWaiting Status = iota
 	// StatusPlaying means every seat is filled and the match is in progress.
 	StatusPlaying
-	// StatusFinished means the match has a winner.
+	// StatusFinished means the match ended in either a win or a draw.
 	StatusFinished
 )
 
@@ -126,8 +126,8 @@ type MoveResult struct {
 	// NOT applied a second time and these are the original result's values.
 	Duplicate bool
 	Status    Status
-	// Turn is whose turn it is now (unchanged by a dead-card swap, and frozen at
-	// the winner on a win).
+	// Turn is whose turn it is now (unchanged by a dead-card swap, frozen at the
+	// winner on a win, and left at the stuck player on a draw).
 	Turn   engine.PlayerID
 	Winner engine.PlayerID
 }
@@ -456,7 +456,7 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 	r.seq = nextSeq
 	r.status = nextStatus
 	if r.status == StatusFinished {
-		r.logger.Info("match finished", "winner", r.gs.Winner, "seq", r.seq)
+		r.logger.Info("match finished", "outcome", r.gs.Outcome, "winner", r.gs.Winner, "seq", r.seq)
 	}
 	res := MoveResult{Seq: r.seq, Status: r.status, Turn: r.gs.Turn, Winner: r.gs.Winner}
 
