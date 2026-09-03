@@ -69,11 +69,13 @@ type Store struct {
 }
 
 type logFile struct {
-	mu           sync.Mutex
-	file         *os.File
-	failed       error
-	closed       bool
-	checkpointed bool
+	mu            sync.Mutex
+	file          *os.File
+	failed        error
+	closed        bool
+	checkpointing bool
+	checkpointSeq uint64
+	checkpointed  bool
 }
 
 // Open creates dir if needed and returns a ready WAL store.
@@ -124,11 +126,11 @@ func (s *Store) Append(event room.Event) error {
 
 	log.mu.Lock()
 	defer log.mu.Unlock()
+	if log.checkpointed || log.checkpointing {
+		return fmt.Errorf("%w: %s", ErrCheckpointed, event.RoomID)
+	}
 	if log.closed {
 		return ErrClosed
-	}
-	if log.checkpointed {
-		return fmt.Errorf("%w: %s", ErrCheckpointed, event.RoomID)
 	}
 	if log.failed != nil {
 		return fmt.Errorf("wal: room %s unavailable after prior failure: %w", event.RoomID, log.failed)
@@ -159,20 +161,9 @@ func (s *Store) fileLocked(roomID string) (*logFile, error) {
 		// fsyncing the file protects its contents; fsyncing the directory protects
 		// the new filename itself. Without both, a create ack could survive while
 		// the per-match WAL disappears after a machine-level crash.
-		dir, err := os.Open(s.dir)
-		if err != nil {
+		if err := syncDir(s.dir); err != nil {
 			_ = f.Close()
-			return nil, fmt.Errorf("wal: open directory for sync: %w", err)
-		}
-		syncErr := dir.Sync()
-		closeErr := dir.Close()
-		if syncErr != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("wal: sync directory: %w", syncErr)
-		}
-		if closeErr != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("wal: close directory after sync: %w", closeErr)
+			return nil, err
 		}
 	}
 	log := &logFile{file: f}
@@ -180,14 +171,15 @@ func (s *Store) fileLocked(roomID string) (*logFile, error) {
 	return log, nil
 }
 
-// Checkpoint truncates a finished match's WAL only after its SQLite archive has
+// Checkpoint removes a finished match's WAL only after its SQLite archive has
 // committed. throughSeq must be the terminal (and therefore final) event in the
 // file; refusing a suffix prevents accidentally discarding an event that the
 // cold tier has not stored.
 //
-// A zero-length file is an idempotent success. That is important when a process
-// commits SQLite and checkpoints the WAL, then dies before its in-memory queue
-// records completion: recovery may safely ask to checkpoint the same match.
+// A missing or zero-length file is an idempotent success. That is important
+// when a process commits SQLite and checkpoints the WAL, then dies before its
+// in-memory queue records completion: recovery may safely ask to checkpoint the
+// same match.
 func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
 	if !validRoomID(roomID) {
 		return fmt.Errorf("wal: unsafe room id %q", roomID)
@@ -201,47 +193,77 @@ func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
 		s.mu.Unlock()
 		return ErrClosed
 	}
-	log, err := s.fileLocked(roomID)
-	s.mu.Unlock()
-	if err != nil {
-		return err
+	log := s.files[roomID]
+	if log == nil {
+		path := filepath.Join(s.dir, roomID+".wal")
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
+		if errors.Is(err, os.ErrNotExist) {
+			s.mu.Unlock()
+			return nil
+		}
+		if err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("wal: open room %s for checkpoint: %w", roomID, err)
+		}
+		log = &logFile{file: file}
+		s.files[roomID] = log
 	}
+	s.mu.Unlock()
 
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	if log.closed {
-		return ErrClosed
-	}
 	if log.checkpointed {
 		return nil
+	}
+	if log.closed && !log.checkpointing {
+		return ErrClosed
 	}
 	if log.failed != nil {
 		return fmt.Errorf("wal: room %s unavailable after prior failure: %w", roomID, log.failed)
 	}
 
 	path := filepath.Join(s.dir, roomID+".wal")
-	events, err := s.readFile(path, roomID)
-	if err != nil {
-		return err
-	}
-	if len(events) == 0 {
-		log.checkpointed = true
-		return nil
-	}
-	last := events[len(events)-1].Seq
-	if last != throughSeq {
-		return fmt.Errorf("wal: checkpoint room %s through %d, final event is %d", roomID, throughSeq, last)
+	if !log.checkpointing {
+		events, err := s.readFile(path, roomID)
+		if err != nil {
+			return err
+		}
+		if len(events) != 0 {
+			last := events[len(events)-1].Seq
+			if last != throughSeq {
+				return fmt.Errorf("wal: checkpoint room %s through %d, final event is %d", roomID, throughSeq, last)
+			}
+		}
+		log.checkpointing = true
+		log.checkpointSeq = throughSeq
+	} else if log.checkpointSeq != throughSeq {
+		return fmt.Errorf("wal: checkpoint room %s already in progress through %d", roomID, log.checkpointSeq)
 	}
 
-	if err := log.file.Truncate(0); err != nil {
-		log.failed = fmt.Errorf("wal: truncate checkpoint for room %s: %w", roomID, err)
-		return log.failed
+	if !log.closed {
+		if err := log.file.Close(); err != nil {
+			log.closed = true
+			return fmt.Errorf("wal: close checkpoint for room %s: %w", roomID, err)
+		}
+		log.closed = true
 	}
-	if err := log.file.Sync(); err != nil {
-		log.failed = fmt.Errorf("wal: sync checkpoint for room %s: %w", roomID, err)
-		return log.failed
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("wal: remove checkpoint for room %s: %w", roomID, err)
 	}
+	if s.policy == SyncAlways {
+		if err := syncDir(s.dir); err != nil {
+			return err
+		}
+	}
+
 	log.checkpointed = true
+	s.mu.Lock()
+	if !s.closed {
+		if s.files[roomID] == log {
+			delete(s.files, roomID)
+		}
+	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -364,13 +386,31 @@ func (s *Store) Close() error {
 	var errs []error
 	for roomID, log := range files {
 		log.mu.Lock()
-		log.closed = true
-		if err := log.file.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("wal: close room %s: %w", roomID, err))
+		if !log.closed {
+			if err := log.file.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("wal: close room %s: %w", roomID, err))
+			}
+			log.closed = true
 		}
 		log.mu.Unlock()
 	}
 	return errors.Join(errs...)
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("wal: open directory for sync: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("wal: sync directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("wal: close directory after sync: %w", closeErr)
+	}
+	return nil
 }
 
 func writeFull(w io.Writer, data []byte) error {

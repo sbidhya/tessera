@@ -106,7 +106,7 @@ current one is confirmed passing.
   - Exactly-once stats use `matches.id` as the transaction idempotency key. A
     retry after SQLite commit does not increment wins/losses twice.
   - WAL checkpointing happens only after the SQLite commit and verifies the
-    archived sequence is the log's final event before truncating it. Recovered
+    archived sequence is the log's final event before removing it. Recovered
     finished WALs are automatically queued again, covering crashes anywhere in
     the write-behind window. See `docs/store.md`.
   - Gate: history + stats persistence ✅; batch + checkpoint retry/idempotency

@@ -81,10 +81,11 @@ process. The attempted state is not published, and clients receive
 new commands.
 
 After B5 archives a finished match in SQLite, it calls `Checkpoint` with the
-terminal sequence. The WAL verifies that no newer record exists, truncates the
-file to zero, and rejects further appends for that finished room. SQLite commits
-first, so a crash can leave an extra WAL to replay but can never leave neither
-copy. See `docs/store.md` for the full write-behind protocol.
+terminal sequence. The WAL verifies that no newer record exists, then closes
+and removes the file. With the default sync policy it also fsyncs the WAL
+directory so the removal is durable. SQLite commits first, so a crash can leave
+an extra WAL to replay but can never leave neither copy. See `docs/store.md` for
+the full write-behind protocol.
 
 ## Test gate
 

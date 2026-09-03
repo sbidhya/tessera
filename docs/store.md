@@ -33,7 +33,7 @@ The successful SQLite commit acknowledges archival and starts the room's
 retention window. A WAL checkpoint failure is retried but does not keep the
 already-archived live room resident forever.
 
-The WAL is never truncated first. A checkpoint also verifies that the requested
+The WAL is never removed first. A checkpoint also verifies that the requested
 terminal sequence is the file's final event, preventing an unarchived suffix
 from being discarded. Finished rooms stop recording presence changes so the
 winning move remains that final event.

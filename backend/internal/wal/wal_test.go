@@ -297,7 +297,7 @@ func TestMoveEventJSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
+func TestCheckpointRemovesOnlyTerminalWAL(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir, SyncAlways)
 	if err != nil {
@@ -317,15 +317,8 @@ func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
 	if err := store.Checkpoint("r_done", 4); err != nil {
 		t.Fatalf("idempotent Checkpoint: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "r_done.wal"))
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if info.Size() != 0 {
-		t.Errorf("checkpointed WAL size = %d, want 0", info.Size())
-	}
-	if err := store.Append(testEvent("r_done", 5, "bob")); !errors.Is(err, ErrCheckpointed) {
-		t.Errorf("Append after checkpoint = %v, want ErrCheckpointed", err)
+	if _, err := os.Stat(filepath.Join(dir, "r_done.wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat checkpointed WAL error = %v, want ErrNotExist", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -344,6 +337,91 @@ func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
 		t.Errorf("checkpointed events = %+v, want none", events)
 	}
 	if err := reopened.Checkpoint("r_done", 4); err != nil {
-		t.Fatalf("checkpoint zero-length WAL after restart: %v", err)
+		t.Fatalf("checkpoint missing WAL after restart: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "r_done.wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repeated checkpoint recreated WAL: %v", err)
+	}
+}
+
+func TestCheckpointReleasesFileDescriptorAndStoreEntry(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, SyncAlways)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	beforeFDs, canCountFDs := openFileDescriptorCount()
+	if err := store.Append(testEvent("r_release", 1, "alice")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	log := store.files["r_release"]
+	if log == nil {
+		t.Fatal("Append did not retain the room log")
+	}
+	if canCountFDs {
+		if got := mustOpenFileDescriptorCount(t); got != beforeFDs+1 {
+			t.Fatalf("open file descriptors after append = %d, want %d", got, beforeFDs+1)
+		}
+	}
+
+	if err := store.Checkpoint("r_release", 1); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got := len(store.files); got != 0 {
+		t.Errorf("Store.files size after checkpoint = %d, want 0", got)
+	}
+	if _, err := log.file.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("checkpointed file Stat error = %v, want ErrClosed", err)
+	}
+	if canCountFDs {
+		if got := mustOpenFileDescriptorCount(t); got != beforeFDs {
+			t.Errorf("open file descriptors after checkpoint = %d, want %d", got, beforeFDs)
+		}
+	}
+	path := filepath.Join(dir, "r_release.wal")
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkpointed WAL Stat error = %v, want ErrNotExist", err)
+	}
+
+	if err := store.Checkpoint("r_release", 1); err != nil {
+		t.Fatalf("second Checkpoint: %v", err)
+	}
+	if got := len(store.files); got != 0 {
+		t.Errorf("Store.files size after second checkpoint = %d, want 0", got)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("second checkpoint recreated WAL: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after checkpoint: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close after checkpoint: %v", err)
+	}
+	if canCountFDs {
+		if got := mustOpenFileDescriptorCount(t); got != beforeFDs {
+			t.Errorf("open file descriptors after Close = %d, want %d", got, beforeFDs)
+		}
+	}
+}
+
+func openFileDescriptorCount() (int, bool) {
+	for _, path := range []string{"/proc/self/fd", "/dev/fd"} {
+		entries, err := os.ReadDir(path)
+		if err == nil {
+			return len(entries), true
+		}
+	}
+	return 0, false
+}
+
+func mustOpenFileDescriptorCount(t *testing.T) int {
+	t.Helper()
+	count, ok := openFileDescriptorCount()
+	if !ok {
+		t.Fatal("file descriptor directory disappeared during test")
+	}
+	return count
 }

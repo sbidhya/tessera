@@ -27,7 +27,7 @@ const (
 // TestCrashBetweenWALAndSQLiteRecovers is the B5 crash gate. The child fsyncs a
 // complete game to the WAL and exits without ever opening SQLite. On restart,
 // room replay reconstructs the terminal result, the write-behind worker stores
-// it exactly once, and only then is the per-match WAL emptied.
+// it exactly once, and only then is the per-match WAL removed.
 func TestCrashBetweenWALAndSQLiteRecovers(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestStoreCrashWriterProcess$")
@@ -85,12 +85,8 @@ func TestCrashBetweenWALAndSQLiteRecovers(t *testing.T) {
 	if len(history) == 0 || history[len(history)-1].Seq != snap.Seq {
 		t.Errorf("history ends at %+v, want seq %d", history, snap.Seq)
 	}
-	info, err := os.Stat(filepath.Join(walDir, matchID+".wal"))
-	if err != nil {
-		t.Fatalf("stat checkpointed WAL: %v", err)
-	}
-	if info.Size() != 0 {
-		t.Errorf("checkpointed WAL size = %d, want 0", info.Size())
+	if _, err := os.Stat(filepath.Join(walDir, matchID+".wal")); !os.IsNotExist(err) {
+		t.Fatalf("stat checkpointed WAL error = %v, want not exist", err)
 	}
 
 	manager.Shutdown()

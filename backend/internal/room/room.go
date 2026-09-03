@@ -476,7 +476,7 @@ func (r *Room) leave(playerID string) error {
 		return ErrNotSeated
 	}
 	// Connection presence has no meaning once the result is final. Keeping the
-	// terminal move as the last durable event lets the cold tier safely truncate
+	// terminal move as the last durable event lets the cold tier safely remove
 	// the entire per-match WAL after archiving it.
 	if r.status == StatusFinished {
 		return nil
