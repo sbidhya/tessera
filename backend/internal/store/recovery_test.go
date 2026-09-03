@@ -85,12 +85,8 @@ func TestCrashBetweenWALAndSQLiteRecovers(t *testing.T) {
 	if len(history) == 0 || history[len(history)-1].Seq != snap.Seq {
 		t.Errorf("history ends at %+v, want seq %d", history, snap.Seq)
 	}
-	info, err := os.Stat(filepath.Join(walDir, matchID+".wal"))
-	if err != nil {
-		t.Fatalf("stat checkpointed WAL: %v", err)
-	}
-	if info.Size() != 0 {
-		t.Errorf("checkpointed WAL size = %d, want 0", info.Size())
+	if _, err := os.Stat(filepath.Join(walDir, matchID+".wal")); !os.IsNotExist(err) {
+		t.Errorf("stat checkpointed WAL = %v, want not-exist", err)
 	}
 
 	manager.Shutdown()
