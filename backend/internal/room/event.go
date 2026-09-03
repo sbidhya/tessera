@@ -59,7 +59,7 @@ type FinishedPlayer struct {
 }
 
 // FinishedMatch is the persistence-neutral archive handed to the cold tier
-// after the winning move is safely in the WAL and published in memory.
+// after the terminal move is safely in the WAL and published in memory.
 // History contains the accepted events through FinishedSeq in authoritative
 // room order, allowing SQLite to serve a complete audit trail without parsing
 // live room internals.

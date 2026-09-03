@@ -16,7 +16,7 @@ const _validRanks = {
   'K',
 };
 const _validSuits = {'spades', 'hearts', 'diamonds', 'clubs'};
-const _validStatuses = {'waiting', 'playing', 'finished'};
+const _validStatuses = {'waiting', 'playing', 'finished', 'drawn'};
 
 /// One card in the backend's stable, human-readable wire format.
 class PlayingCard {
@@ -319,8 +319,7 @@ class MatchState {
     if (viewer == null && hand.isNotEmpty) {
       throw const FormatException('spectator state exposes a hand');
     }
-    if (winner != null && status != 'finished' ||
-        winner == null && status == 'finished') {
+    if ((status == 'finished') != (winner != null)) {
       throw const FormatException('winner does not match status');
     }
 

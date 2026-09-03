@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -72,6 +73,169 @@ func TestNewGameValidation(t *testing.T) {
 	if gs.SequencesToWin != 2 {
 		t.Errorf("SequencesToWin=0 should default to 2, got %d", gs.SequencesToWin)
 	}
+}
+
+func TestDeckExhaustionDrawRule(t *testing.T) {
+	liveCell := Cell{Row: 4, Col: 4}
+	cases := []struct {
+		name  string
+		setup func(*GameState)
+		want  Outcome
+	}{
+		{
+			name: "empty hand is stuck",
+			setup: func(gs *GameState) {
+				gs.Draw = nil
+			},
+			want: OutcomeDrawn,
+		},
+		{
+			name: "cards still in deck",
+			setup: func(gs *GameState) {
+				gs.Draw = []Card{{Ace, Spades}}
+			},
+			want: OutcomeInProgress,
+		},
+		{
+			name: "normal card can be placed",
+			setup: func(gs *GameState) {
+				card, _ := gs.Board.CardAt(liveCell)
+				gs.Hands[0] = []Card{card}
+			},
+			want: OutcomeInProgress,
+		},
+		{
+			name: "two eyed jack can be placed",
+			setup: func(gs *GameState) {
+				gs.Hands[0] = []Card{{Jack, Diamonds}}
+			},
+			want: OutcomeInProgress,
+		},
+		{
+			name: "one eyed jack can remove",
+			setup: func(gs *GameState) {
+				gs.Hands[0] = []Card{{Jack, Hearts}}
+				gs.Chips[liveCell] = Chip{Owner: 1}
+			},
+			want: OutcomeInProgress,
+		},
+		{
+			name: "dead card cannot advance play",
+			setup: func(gs *GameState) {
+				card, _ := gs.Board.CardAt(liveCell)
+				gs.Hands[0] = []Card{card}
+				for _, cell := range gs.Board.CellsFor(card) {
+					gs.Chips[cell] = Chip{Owner: 1}
+				}
+			},
+			want: OutcomeDrawn,
+		},
+		{
+			name: "locked chips cannot be removed",
+			setup: func(gs *GameState) {
+				gs.Hands[0] = []Card{{Jack, Hearts}}
+				gs.Chips[liveCell] = Chip{Owner: 1, InSequence: true}
+			},
+			want: OutcomeDrawn,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gs := controlled(999)
+			tc.setup(gs)
+			gs.markDrawIfStuck()
+			if gs.Outcome != tc.want {
+				t.Fatalf("outcome = %d, want %d", gs.Outcome, tc.want)
+			}
+			if got := gs.GameOver(); got != (tc.want != OutcomeInProgress) {
+				t.Fatalf("GameOver = %t, want %t", got, tc.want != OutcomeInProgress)
+			}
+		})
+	}
+}
+
+func TestFullDeckExhaustionEndsInDraw(t *testing.T) {
+	gs, err := NewGame(rand.New(rand.NewPCG(1, 2)), Options{
+		NumPlayers:     2,
+		SequencesToWin: 999, // exercise exhaustion rather than the normal win path
+	})
+	if err != nil {
+		t.Fatalf("NewGame: %v", err)
+	}
+
+	for moves := 0; !gs.GameOver(); moves++ {
+		if moves >= 500 {
+			t.Fatal("game did not terminate after consuming one deck")
+		}
+		move, ok := chooseLegalMove(gs)
+		if !ok {
+			t.Fatalf("player %d has no accepted action with %d cards still in the draw pile", gs.Turn, len(gs.Draw))
+		}
+		if err := gs.Apply(move); err != nil {
+			t.Fatalf("move %d (%+v): %v", moves, move, err)
+		}
+	}
+
+	if gs.Outcome != OutcomeDrawn || gs.Winner != NoPlayer {
+		t.Fatalf("terminal result = outcome %d winner %d, want draw", gs.Outcome, gs.Winner)
+	}
+	if len(gs.Draw) != 0 {
+		t.Fatalf("draw pile has %d cards, want empty", len(gs.Draw))
+	}
+	remaining := len(gs.Discard)
+	for p := PlayerID(0); p < PlayerID(gs.NumPlayers); p++ {
+		remaining += len(gs.Hands[p])
+	}
+	if remaining != len(NewDeck()) {
+		t.Fatalf("cards accounted for = %d, want full %d-card deck", remaining, len(NewDeck()))
+	}
+	if err := gs.Apply(Move{Player: gs.Turn}); !errors.Is(err, ErrGameOver) {
+		t.Fatalf("post-draw move err = %v, want %v", err, ErrGameOver)
+	}
+}
+
+func chooseLegalMove(gs *GameState) (Move, bool) {
+	p := gs.Turn
+	for _, card := range gs.Hands[p] {
+		switch {
+		case card.IsTwoEyedJack():
+			for row := 0; row < BoardSize; row++ {
+				for col := 0; col < BoardSize; col++ {
+					cell := Cell{Row: row, Col: col}
+					if !gs.Board.IsCorner(cell) {
+						if _, occupied := gs.Chips[cell]; !occupied {
+							return Move{Player: p, Type: MovePlace, Card: card, Cell: cell}, true
+						}
+					}
+				}
+			}
+		case card.IsOneEyedJack():
+			for row := 0; row < BoardSize; row++ {
+				for col := 0; col < BoardSize; col++ {
+					cell := Cell{Row: row, Col: col}
+					if chip, occupied := gs.Chips[cell]; occupied && chip.Owner != p && !chip.InSequence {
+						return Move{Player: p, Type: MoveRemove, Card: card, Cell: cell}, true
+					}
+				}
+			}
+		default:
+			for _, cell := range gs.Board.CellsFor(card) {
+				if _, occupied := gs.Chips[cell]; !occupied {
+					return Move{Player: p, Type: MovePlace, Card: card, Cell: cell}, true
+				}
+			}
+		}
+	}
+
+	if !gs.deadCardUsed {
+		for _, card := range gs.Hands[p] {
+			if gs.isDead(card) {
+				return Move{Player: p, Type: MoveDeadCard, Card: card}, true
+			}
+		}
+	}
+	return Move{}, false
 }
 
 func TestApplyPlaceNormalCard(t *testing.T) {
@@ -360,7 +524,7 @@ func TestPlaceRecordsSequenceWithoutWinning(t *testing.T) {
 	gs.place(0, Cell{5, 1}, Cell{5, 2}, Cell{5, 3}, Cell{5, 4})
 	winCard, _ := gs.Board.CardAt(Cell{5, 5})
 	gs.Hands[0] = []Card{winCard}
-	gs.Draw = []Card{{Queen, Clubs}}
+	gs.Draw = []Card{{Ace, Spades}, {Queen, Clubs}}
 
 	if err := gs.Apply(Move{Player: 0, Type: MovePlace, Card: winCard, Cell: Cell{5, 5}}); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -389,6 +553,9 @@ func TestWinCondition(t *testing.T) {
 	}
 	if gs.Winner != 0 {
 		t.Fatalf("winner = %d, want 0", gs.Winner)
+	}
+	if gs.Outcome != OutcomeWon {
+		t.Fatalf("outcome = %d, want won", gs.Outcome)
 	}
 	if !gs.GameOver() {
 		t.Error("game should be over")

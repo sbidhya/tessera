@@ -7,12 +7,12 @@ WAL, where they can be replayed after a crash.
 
 ## Durability order
 
-The winning move still follows B4's append-before-apply rule. Once the room has
+The terminal move still follows B4's append-before-apply rule. Once the room has
 published that terminal state, it enqueues a `FinishedMatch` value to the cold
 store; the room never performs SQL itself.
 
 ```text
-winning move -> fsync WAL -> publish finished room -> enqueue archive -> ack
+terminal move -> fsync WAL -> publish finished room -> enqueue archive -> ack
                                                    |
                                                    v
                        batch SQLite transaction -> commit -> checkpoint WAL
@@ -36,7 +36,7 @@ already-archived live room resident forever.
 The WAL is never truncated first. A checkpoint also verifies that the requested
 terminal sequence is the file's final event, preventing an unarchived suffix
 from being discarded. Finished rooms stop recording presence changes so the
-winning move remains that final event.
+terminal move remains that final event.
 
 ## Write-behind worker
 
@@ -47,7 +47,7 @@ the remaining queue once.
 
 One SQLite transaction writes every match in a batch:
 
-- `matches` — final sequence, options, winner, move count, archive time;
+- `matches` — final sequence, options, nullable winner, move count, archive time;
 - `match_players` — seat, result, and completed-sequence count;
 - `match_events` — the accepted room events in sequence order as JSON;
 - `player_stats` — matches played, wins, losses, and sequences completed.
@@ -58,6 +58,11 @@ An SHA-256 digest of the complete terminal projection also makes a conflicting
 reuse of a match id fail rather than silently checkpointing different history.
 SQLite itself runs in WAL journal mode with full synchronous commits; this is
 separate from Tessera's per-match recovery WAL.
+
+Drawn matches store SQL `NULL` in both `winner_player_id` and `winner_seat`.
+They increment `matches_played` and completed-sequence totals, but neither wins
+nor losses. Startup migrates the original `NOT NULL` winner columns by rebuilding
+the `matches` table while preserving existing rows and foreign-key references.
 
 The pure engine and room actor remain inward layers. `room` defines only the
 persistence-neutral finished-match value and sink interface; the concrete SQL

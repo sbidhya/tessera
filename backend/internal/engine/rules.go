@@ -112,6 +112,7 @@ func (gs *GameState) applyRemove(m Move, handIdx int) error {
 	delete(gs.Chips, m.Cell)
 	gs.spendAndDraw(m.Player, handIdx)
 	gs.nextTurn()
+	gs.markDrawIfStuck()
 	return nil
 }
 
@@ -128,10 +129,11 @@ func (gs *GameState) applyDeadCard(m Move, handIdx int) error {
 	// makes a normal play afterwards.
 	gs.Discard = append(gs.Discard, m.Card)
 	gs.removeFromHand(m.Player, handIdx)
-	if drawn := gs.drawCard(); drawn != (Card{}) {
+	if drawn, ok := gs.drawCard(); ok {
 		gs.Hands[m.Player] = append(gs.Hands[m.Player], drawn)
 	}
 	gs.deadCardUsed = true
+	gs.markDrawIfStuck()
 	return nil
 }
 
@@ -160,7 +162,7 @@ func (gs *GameState) spendAndDraw(p PlayerID, handIdx int) {
 	spent := gs.Hands[p][handIdx]
 	gs.Discard = append(gs.Discard, spent)
 	gs.removeFromHand(p, handIdx)
-	if drawn := gs.drawCard(); drawn != (Card{}) {
+	if drawn, ok := gs.drawCard(); ok {
 		gs.Hands[p] = append(gs.Hands[p], drawn)
 	}
 }
@@ -173,8 +175,55 @@ func (gs *GameState) scoreAndAdvance(placed Cell, p PlayerID) {
 		gs.SequencesWon[p] += n
 		if gs.SequencesWon[p] >= gs.SequencesToWin {
 			gs.Winner = p
+			gs.Outcome = OutcomeWon
 			return // game over; do not advance the turn
 		}
 	}
 	gs.nextTurn()
+	gs.markDrawIfStuck()
+}
+
+// markDrawIfStuck ends an exhausted-deck game when the player to move cannot
+// complete their turn with a placement or removal. A dead-card exchange is not
+// sufficient by itself: it does not advance the turn, and with no draw pile it
+// cannot turn an otherwise stuck position into a playable one.
+func (gs *GameState) markDrawIfStuck() {
+	if gs.Outcome != OutcomeInProgress || len(gs.Draw) != 0 || gs.hasLegalMove(gs.Turn) {
+		return
+	}
+	gs.Outcome = OutcomeDrawn
+}
+
+// hasLegalMove reports whether p can place a chip or remove an opposing chip
+// with their current hand. It deliberately excludes dead-card exchanges; see
+// markDrawIfStuck.
+func (gs *GameState) hasLegalMove(p PlayerID) bool {
+	for _, card := range gs.Hands[p] {
+		switch {
+		case card.IsTwoEyedJack():
+			for row := 0; row < BoardSize; row++ {
+				for col := 0; col < BoardSize; col++ {
+					cell := Cell{Row: row, Col: col}
+					if !gs.Board.IsCorner(cell) {
+						if _, occupied := gs.Chips[cell]; !occupied {
+							return true
+						}
+					}
+				}
+			}
+		case card.IsOneEyedJack():
+			for _, chip := range gs.Chips {
+				if chip.Owner != p && !chip.InSequence {
+					return true
+				}
+			}
+		default:
+			for _, cell := range gs.Board.CellsFor(card) {
+				if _, occupied := gs.Chips[cell]; !occupied {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

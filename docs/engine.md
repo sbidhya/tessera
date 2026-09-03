@@ -69,5 +69,9 @@ sequences at once; `TestDetectTwoSequencesAtOnce` covers that.
 ## Scope (v1)
 
 - 2 players; `SequencesToWin` configurable (default 2, use 1 for fast games).
-- Empty draw pile is a rare late-game edge case: a play still succeeds but no
-  replacement is drawn (the hand shrinks).
+- A play after the draw pile empties still succeeds without a replacement. The
+  match is drawn once the deck is empty and the next player has no legal chip
+  placement or removal. This is more accurate than waiting for both hands to be
+  empty: a hand containing only dead cards or unusable one-eyed jacks cannot
+  advance the game. A dead-card exchange does not count as a legal continuation
+  when no replacement can be drawn because it does not end the turn.

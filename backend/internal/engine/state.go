@@ -11,6 +11,16 @@ type PlayerID int
 // NoPlayer is the zero-value sentinel for "no player" (e.g. no winner yet).
 const NoPlayer PlayerID = -1
 
+// Outcome is the terminal result of a match. OutcomeInProgress is the zero
+// value so a GameState cannot accidentally look finished before play starts.
+type Outcome uint8
+
+const (
+	OutcomeInProgress Outcome = iota
+	OutcomeWon
+	OutcomeDrawn
+)
+
 // Chip is a marker a player has placed on a cell.
 type Chip struct {
 	// Owner is the player who placed the chip.
@@ -70,7 +80,14 @@ type GameState struct {
 	SequencesWon map[PlayerID]int
 	Sequences    []Sequence
 
-	// Winner is the winning player, or NoPlayer while the game is in progress.
+	// Outcome distinguishes an unfinished match from a terminal draw. A draw is
+	// declared after the deck is empty and the player whose turn it is has no
+	// legal place or removal. We use that rule instead of waiting for every hand
+	// to be empty: dead cards and unusable one-eyed jacks cannot advance play, so
+	// requiring empty hands could still leave a match stuck forever.
+	Outcome Outcome
+
+	// Winner is the winning player, or NoPlayer unless Outcome is OutcomeWon.
 	Winner PlayerID
 
 	// deadCardUsed tracks the once-per-turn dead-card swap allowance.
@@ -100,6 +117,7 @@ func NewGame(rng *rand.Rand, opts Options) (*GameState, error) {
 		NumPlayers:     opts.NumPlayers,
 		SequencesToWin: opts.SequencesToWin,
 		SequencesWon:   make(map[PlayerID]int, opts.NumPlayers),
+		Outcome:        OutcomeInProgress,
 		Winner:         NoPlayer,
 	}
 
@@ -113,7 +131,7 @@ func NewGame(rng *rand.Rand, opts Options) (*GameState, error) {
 	// real shuffled deck).
 	for i := 0; i < hs; i++ {
 		for p := 0; p < opts.NumPlayers; p++ {
-			card := gs.drawCard()
+			card, _ := gs.drawCard()
 			gs.Hands[PlayerID(p)] = append(gs.Hands[PlayerID(p)], card)
 		}
 	}
@@ -121,20 +139,20 @@ func NewGame(rng *rand.Rand, opts Options) (*GameState, error) {
 	return gs, nil
 }
 
-// GameOver reports whether the game has a winner.
-func (gs *GameState) GameOver() bool { return gs.Winner != NoPlayer }
+// GameOver reports whether the game has ended in either a win or a draw.
+func (gs *GameState) GameOver() bool { return gs.Outcome != OutcomeInProgress }
 
-// drawCard pops the top card off the draw pile. It returns the zero Card if the
-// pile is empty; callers treat an empty pile as "no replacement drawn" (hands
-// simply shrink), which is a rare late-game edge case.
-func (gs *GameState) drawCard() Card {
+// drawCard pops the top card off the draw pile. The boolean is false when the
+// pile is empty. Card{} cannot be an empty sentinel because it is the valid ace
+// of spades.
+func (gs *GameState) drawCard() (Card, bool) {
 	n := len(gs.Draw)
 	if n == 0 {
-		return Card{}
+		return Card{}, false
 	}
 	card := gs.Draw[n-1]
 	gs.Draw = gs.Draw[:n-1]
-	return card
+	return card, true
 }
 
 // handIndex returns the index of card in player p's hand, or -1 if absent.

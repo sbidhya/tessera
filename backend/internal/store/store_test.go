@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -70,9 +72,15 @@ func testStore(t *testing.T, checkpoint Checkpointer, batch int) *Store {
 }
 
 func finishedMatch(id, winner string) room.FinishedMatch {
-	winnerSeat := engine.PlayerID(0)
-	if winner == "bob" {
+	winnerSeat := engine.NoPlayer
+	if winner == "alice" {
+		winnerSeat = 0
+	} else if winner == "bob" {
 		winnerSeat = 1
+	}
+	movePlayer := winner
+	if movePlayer == "" {
+		movePlayer = "alice"
 	}
 	players := []room.FinishedPlayer{
 		{ID: "alice", Seat: 0, Sequences: 1, Won: winner == "alice"},
@@ -91,7 +99,7 @@ func finishedMatch(id, winner string) room.FinishedMatch {
 			{Version: room.EventVersion, Type: room.EventPlayerJoined, RoomID: id, Seq: 2, PlayerID: "alice"},
 			{Version: room.EventVersion, Type: room.EventPlayerJoined, RoomID: id, Seq: 3, PlayerID: "bob"},
 			{Version: room.EventVersion, Type: room.EventMoveApplied, RoomID: id, Seq: 4,
-				Move: room.MoveRequest{PlayerID: winner, MoveID: "winning-move"}},
+				Move: room.MoveRequest{PlayerID: movePlayer, MoveID: "terminal-move"}},
 		},
 	}
 }
@@ -146,6 +154,114 @@ func TestPersistsMatchHistoryAndStatsBeforeCheckpoint(t *testing.T) {
 		if found != want {
 			t.Errorf("HasMatch(%s) = %t, want %t", id, found, want)
 		}
+	}
+}
+
+func TestPersistsDrawWithNullableWinnerAndNoLosses(t *testing.T) {
+	checkpoint := &checkpointRecorder{}
+	s := testStore(t, checkpoint, 8)
+	match := finishedMatch("r_draw", "")
+
+	s.MatchFinished(match, nil)
+	if err := s.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	got, err := s.Match(t.Context(), match.RoomID)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	if got.WinnerID != "" || got.WinnerSeat != engine.NoPlayer {
+		t.Errorf("draw winner = %q/%d, want empty/%d", got.WinnerID, got.WinnerSeat, engine.NoPlayer)
+	}
+	var winnerID, winnerSeat any
+	if err := s.db.QueryRow(`SELECT winner_player_id, winner_seat FROM matches WHERE id = ?`, match.RoomID).
+		Scan(&winnerID, &winnerSeat); err != nil {
+		t.Fatalf("query draw winner: %v", err)
+	}
+	if winnerID != nil || winnerSeat != nil {
+		t.Errorf("database draw winner = %#v/%#v, want NULL/NULL", winnerID, winnerSeat)
+	}
+	assertStats(t, s, "alice", 1, 0, 0, 1)
+	assertStats(t, s, "bob", 1, 0, 0, 1)
+	if checkpoint.callCount() != 1 {
+		t.Errorf("checkpoint calls = %d, want 1", checkpoint.callCount())
+	}
+}
+
+func TestMigratesExistingWinnerColumnsToNullable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE matches (
+		id TEXT PRIMARY KEY,
+		finished_seq INTEGER NOT NULL,
+		num_players INTEGER NOT NULL,
+		sequences_to_win INTEGER NOT NULL,
+		winner_player_id TEXT NOT NULL,
+		winner_seat INTEGER NOT NULL,
+		move_count INTEGER NOT NULL,
+		archive_hash BLOB NOT NULL,
+		archived_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE match_players (
+		match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+		player_id TEXT NOT NULL,
+		seat INTEGER NOT NULL,
+		won INTEGER NOT NULL CHECK (won IN (0, 1)),
+		sequences_completed INTEGER NOT NULL,
+		PRIMARY KEY (match_id, player_id),
+		UNIQUE (match_id, seat)
+	)`)
+	if err != nil {
+		t.Fatalf("create legacy child schema: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"r_legacy", 4, 2, 1, "alice", 0, 1, []byte{1}, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatalf("insert legacy match: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO match_players VALUES (?, ?, ?, ?, ?)`, "r_legacy", "alice", 0, 1, 1)
+	if err != nil {
+		t.Fatalf("insert legacy player: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	s, err := Open(path, &checkpointRecorder{}, nil, Options{FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatalf("Open migrated database: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	for _, column := range []string{"winner_player_id", "winner_seat"} {
+		var notNull int
+		if err := s.db.QueryRow(`SELECT "notnull" FROM pragma_table_info('matches') WHERE name = ?`, column).
+			Scan(&notNull); err != nil {
+			t.Fatalf("inspect %s: %v", column, err)
+		}
+		if notNull != 0 {
+			t.Errorf("%s NOT NULL = %d, want 0", column, notNull)
+		}
+	}
+	got, err := s.Match(t.Context(), "r_legacy")
+	if err != nil {
+		t.Fatalf("read migrated match: %v", err)
+	}
+	if got.WinnerID != "alice" || got.WinnerSeat != 0 {
+		t.Errorf("migrated winner = %q/%d, want alice/0", got.WinnerID, got.WinnerSeat)
+	}
+	var playerRows int
+	if err := s.db.QueryRow(`SELECT count(*) FROM match_players WHERE match_id = ?`, "r_legacy").Scan(&playerRows); err != nil {
+		t.Fatalf("read migrated child row: %v", err)
+	}
+	if playerRows != 1 {
+		t.Errorf("migrated child rows = %d, want 1", playerRows)
 	}
 }
 

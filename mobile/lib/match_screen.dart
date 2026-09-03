@@ -180,8 +180,15 @@ class _MatchSummaryCard extends StatelessWidget {
     final headline = switch (state.status) {
       'waiting' => 'Waiting for players',
       'finished' => 'Player ${state.winner! + 1} won',
+      'drawn' => 'Match drawn',
       _ when viewer == state.turn => 'Your turn',
       _ => 'Player ${state.turn + 1}\'s turn',
+    };
+    final terminal = state.status == 'finished' || state.status == 'drawn';
+    final icon = switch (state.status) {
+      'drawn' => Icons.handshake,
+      'finished' => Icons.emoji_events,
+      _ => Icons.casino,
     };
     final view = viewer == null
         ? 'Spectator view'
@@ -193,8 +200,8 @@ class _MatchSummaryCard extends StatelessWidget {
         child: Row(
           children: [
             Icon(
-              state.status == 'finished' ? Icons.emoji_events : Icons.casino,
-              color: state.status == 'finished'
+              icon,
+              color: terminal
                   ? Colors.amber.shade800
                   : Theme.of(context).colorScheme.primary,
             ),
