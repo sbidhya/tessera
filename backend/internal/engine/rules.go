@@ -30,6 +30,11 @@ type Move struct {
 // MovePlace and MoveRemove consume the played card, draw a replacement, run
 // sequence detection through the affected cell, may set a winner, and advance the
 // turn. MoveDeadCard swaps one dead card and leaves the turn with the same player.
+//
+// A successful move that leaves the draw pile empty and the player to move with
+// no legal move marks the game Drawn (see GameState.Drawn). A win takes
+// precedence: a winning move never becomes a draw even if it also empties the
+// pile.
 func (gs *GameState) Apply(m Move) error {
 	if gs.GameOver() {
 		return ErrGameOver
@@ -112,6 +117,7 @@ func (gs *GameState) applyRemove(m Move, handIdx int) error {
 	delete(gs.Chips, m.Cell)
 	gs.spendAndDraw(m.Player, handIdx)
 	gs.nextTurn()
+	gs.checkDraw()
 	return nil
 }
 
@@ -128,10 +134,11 @@ func (gs *GameState) applyDeadCard(m Move, handIdx int) error {
 	// makes a normal play afterwards.
 	gs.Discard = append(gs.Discard, m.Card)
 	gs.removeFromHand(m.Player, handIdx)
-	if drawn := gs.drawCard(); drawn != (Card{}) {
+	if drawn, ok := gs.drawCard(); ok {
 		gs.Hands[m.Player] = append(gs.Hands[m.Player], drawn)
 	}
 	gs.deadCardUsed = true
+	gs.checkDraw()
 	return nil
 }
 
@@ -160,14 +167,15 @@ func (gs *GameState) spendAndDraw(p PlayerID, handIdx int) {
 	spent := gs.Hands[p][handIdx]
 	gs.Discard = append(gs.Discard, spent)
 	gs.removeFromHand(p, handIdx)
-	if drawn := gs.drawCard(); drawn != (Card{}) {
+	if drawn, ok := gs.drawCard(); ok {
 		gs.Hands[p] = append(gs.Hands[p], drawn)
 	}
 }
 
 // scoreAndAdvance runs sequence detection through the just-placed cell, updates
 // the winner if the player has reached SequencesToWin, and advances the turn if
-// the game is not over.
+// the game is not over. When the game continues with an empty draw pile, it
+// marks a draw if the player to move has no legal move.
 func (gs *GameState) scoreAndAdvance(placed Cell, p PlayerID) {
 	if n := gs.detectSequencesThrough(placed, p); n > 0 {
 		gs.SequencesWon[p] += n
@@ -177,4 +185,91 @@ func (gs *GameState) scoreAndAdvance(placed Cell, p PlayerID) {
 		}
 	}
 	gs.nextTurn()
+	gs.checkDraw()
+}
+
+// checkDraw marks the game drawn when the draw pile is exhausted and the player
+// to move has no legal move. A decided game stays decided: it never overrides
+// a winner and never clears Drawn.
+func (gs *GameState) checkDraw() {
+	if gs.Winner != NoPlayer || gs.Drawn {
+		return
+	}
+	if len(gs.Draw) != 0 {
+		return
+	}
+	if !gs.HasLegalMove(gs.Turn) {
+		gs.Drawn = true
+	}
+}
+
+// HasLegalMove reports whether player p can make any legal move from the
+// current position, given the current per-turn dead-card allowance. Normal
+// cards are always actionable (either placed on an open matching cell or, when
+// dead, swapped); two-eyed jacks need any open cell; one-eyed jacks need a
+// removable opponent chip. An empty hand has no legal move.
+func (gs *GameState) HasLegalMove(p PlayerID) bool {
+	hand := gs.Hands[p]
+	if len(hand) == 0 {
+		return false
+	}
+	openComputed, open := false, false
+	removableComputed, removable := false, false
+	for _, card := range hand {
+		switch {
+		case card.IsTwoEyedJack():
+			if !openComputed {
+				open = gs.hasOpenCell()
+				openComputed = true
+			}
+			if open {
+				return true
+			}
+		case card.IsOneEyedJack():
+			if !removableComputed {
+				removable = gs.hasRemovableChip(p)
+				removableComputed = true
+			}
+			if removable {
+				return true
+			}
+		default:
+			for _, cell := range gs.Board.CellsFor(card) {
+				if _, occupied := gs.Chips[cell]; !occupied && !gs.Board.IsCorner(cell) {
+					return true
+				}
+			}
+			if !gs.deadCardUsed && gs.isDead(card) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasOpenCell reports whether any non-corner cell is free of chips.
+func (gs *GameState) hasOpenCell() bool {
+	for row := 0; row < BoardSize; row++ {
+		for col := 0; col < BoardSize; col++ {
+			cell := Cell{Row: row, Col: col}
+			if gs.Board.IsCorner(cell) {
+				continue
+			}
+			if _, occupied := gs.Chips[cell]; !occupied {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasRemovableChip reports whether p can remove any chip: an opponent's chip
+// not locked into a completed sequence.
+func (gs *GameState) hasRemovableChip(p PlayerID) bool {
+	for _, chip := range gs.Chips {
+		if chip.Owner != p && !chip.InSequence {
+			return true
+		}
+	}
+	return false
 }

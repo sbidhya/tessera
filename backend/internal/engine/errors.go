@@ -6,7 +6,8 @@ import "errors"
 // (the room manager, transport) can distinguish "your move was illegal" from a
 // transport/system failure and surface a precise reason to the client.
 var (
-	// ErrGameOver is returned when a move is attempted after a winner exists.
+	// ErrGameOver is returned when a move is attempted after the game is over
+	// (a win or a draw).
 	ErrGameOver = errors.New("engine: game is over")
 	// ErrNotYourTurn is returned when a player moves out of turn.
 	ErrNotYourTurn = errors.New("engine: not this player's turn")

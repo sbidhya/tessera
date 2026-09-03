@@ -136,11 +136,37 @@ state:
 }
 ```
 
+A terminal move reports `"status": "finished"`. The winner is the winning seat
+on a win and `null` on a draw.
+
 ### Server → client: state
 
 `state` is sent on connect, join/reconnect, disconnect, and after each accepted
 move. Each connection gets a separately rendered snapshot, so an opponent's
 cards never enter the socket's outbound queue.
+
+`status` is `"waiting"`, `"playing"`, or `"finished"`. `winner` is the winning
+seat or `null`. A finished match with a non-null winner is a win; a finished
+match with a `null` winner is a **draw** — the deck ran out with no legal move
+left for the player to move, so the room, hub, and WAL are released exactly as
+for a win. Clients must branch on the winner, not the status: `finished` alone
+does not imply a winner.
+
+```json
+{
+  "type": "state",
+  "seq": 105,
+  "payload": {
+    "state": {
+      "match_id": "r_12ab34cd56ef",
+      "status": "finished",
+      "turn": 1,
+      "winner": null,
+      "draw_remaining": 0
+    }
+  }
+}
+```
 
 ### Server → client: error
 

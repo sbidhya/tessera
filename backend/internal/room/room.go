@@ -56,7 +56,10 @@ const (
 	StatusWaiting Status = iota
 	// StatusPlaying means every seat is filled and the match is in progress.
 	StatusPlaying
-	// StatusFinished means the match has a winner.
+	// StatusFinished means the match reached a terminal result: a win or a
+	// draw. A draw is a finished match with no winner (engine Winner ==
+	// NoPlayer); clients distinguish it by the null winner, and the cold tier
+	// archives it exactly like a win so its room, hub, and WAL are released.
 	StatusFinished
 )
 
@@ -126,9 +129,12 @@ type MoveResult struct {
 	// NOT applied a second time and these are the original result's values.
 	Duplicate bool
 	Status    Status
-	// Turn is whose turn it is now (unchanged by a dead-card swap, and frozen at
-	// the winner on a win).
-	Turn   engine.PlayerID
+	// Turn is whose turn it is now (unchanged by a dead-card swap, frozen at
+	// the winner on a win, and frozen at the stuck player on a draw).
+	Turn engine.PlayerID
+	// Winner is the winning seat, or engine.NoPlayer while playing and on a
+	// draw. Status (not Winner) marks terminality: StatusFinished with
+	// Winner == NoPlayer is a draw.
 	Winner engine.PlayerID
 }
 
@@ -144,6 +150,8 @@ type Snapshot struct {
 	Seq    uint64
 	Status Status
 	Turn   engine.PlayerID
+	// Winner is engine.NoPlayer while playing and on a draw; a draw reads as
+	// StatusFinished with no winner.
 	Winner engine.PlayerID
 	// NumPlayers and SequencesToWin are immutable match settings included so
 	// outer layers can describe a room without reaching into engine state.
@@ -437,6 +445,9 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 		// effect, so a corrected retry may reuse the id and be re-evaluated.
 		return MoveResult{}, err
 	}
+	// GameOver covers both terminal states — a win and a draw — so both map
+	// to StatusFinished and flow through the same archive-then-checkpoint
+	// path below. No draw-specific branch is needed here.
 	nextStatus := r.status
 	if next.GameOver() {
 		nextStatus = StatusFinished
@@ -456,7 +467,7 @@ func (r *Room) playMove(req MoveRequest) (MoveResult, error) {
 	r.seq = nextSeq
 	r.status = nextStatus
 	if r.status == StatusFinished {
-		r.logger.Info("match finished", "winner", r.gs.Winner, "seq", r.seq)
+		r.logger.Info("match finished", "winner", r.gs.Winner, "draw", r.gs.IsDraw(), "seq", r.seq)
 	}
 	res := MoveResult{Seq: r.seq, Status: r.status, Turn: r.gs.Turn, Winner: r.gs.Winner}
 
@@ -567,6 +578,9 @@ func (r *Room) occupied() int {
 
 // finishedMatch builds the cold-tier projection. It is called only by the room
 // goroutine, or during single-threaded recovery before that goroutine starts.
+//
+// A draw projects with Winner == engine.NoPlayer and no Won player; the store
+// persists that as a NULL winner rather than rejecting the archive.
 func (r *Room) finishedMatch() FinishedMatch {
 	players := make([]FinishedPlayer, 0, len(r.seats))
 	for i, seat := range r.seats {

@@ -7,9 +7,12 @@ WAL, where they can be replayed after a crash.
 
 ## Durability order
 
-The winning move still follows B4's append-before-apply rule. Once the room has
-published that terminal state, it enqueues a `FinishedMatch` value to the cold
-store; the room never performs SQL itself.
+The terminal (winning or drawing) move still follows B4's append-before-apply
+rule. Once the room has published that terminal state, it enqueues a
+`FinishedMatch` value to the cold store; the room never performs SQL itself.
+A draw archives with NULL winner columns and no `Won` player, banks no win or
+loss for either participant (only the match played), and still checkpoints
+the match WAL so the room, hub, and WAL file are released.
 
 ```text
 winning move -> fsync WAL -> publish finished room -> enqueue archive -> ack
@@ -47,7 +50,8 @@ the remaining queue once.
 
 One SQLite transaction writes every match in a batch:
 
-- `matches` — final sequence, options, winner, move count, archive time;
+- `matches` — final sequence, options, winner (NULL on draws), move count,
+  archive time;
 - `match_players` — seat, result, and completed-sequence count;
 - `match_events` — the accepted room events in sequence order as JSON;
 - `player_stats` — matches played, wins, losses, and sequences completed.

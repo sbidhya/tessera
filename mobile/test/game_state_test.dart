@@ -55,4 +55,35 @@ void main() {
 
     expect(() => MatchSnapshot.fromJson(json), throwsFormatException);
   });
+
+  test('a finished match with no winner parses as a draw', () {
+    final json = matchSnapshotJson();
+    final state = json['state']! as Map<String, Object?>;
+    state['status'] = 'finished';
+    state['winner'] = null;
+
+    final snapshot = MatchSnapshot.fromJson(json);
+    expect(snapshot.state.status, 'finished');
+    expect(snapshot.state.winner, isNull);
+    expect(snapshot.state.isDraw, isTrue);
+  });
+
+  test('a finished match with a winner parses as a win', () {
+    final json = matchSnapshotJson();
+    final state = json['state']! as Map<String, Object?>;
+    state['status'] = 'finished';
+    state['winner'] = 1;
+
+    final snapshot = MatchSnapshot.fromJson(json);
+    expect(snapshot.state.winner, 1);
+    expect(snapshot.state.isDraw, isFalse);
+  });
+
+  test('rejects a winner on a match that is still playing', () {
+    final json = matchSnapshotJson();
+    final state = json['state']! as Map<String, Object?>;
+    state['winner'] = 0;
+
+    expect(() => MatchSnapshot.fromJson(json), throwsFormatException);
+  });
 }

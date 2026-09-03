@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -85,6 +87,28 @@ void main() {
     await tester.pumpAndSettle();
     expect(calls, 2);
     expect(find.byKey(const Key('sequenceBoard')), findsOneWidget);
+  });
+
+  testWidgets('a drawn match renders the draw headline, not a winner', (
+    tester,
+  ) async {
+    await pumpMatch(
+      tester,
+      MockClient((request) async {
+        final json = matchSnapshotJson();
+        final state = json['state']! as Map<String, Object?>;
+        state['status'] = 'finished';
+        state['winner'] = null;
+        return http.Response(
+          jsonEncode(json),
+          200,
+          headers: const {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    expect(find.text('Draw — deck exhausted'), findsOneWidget);
+    expect(find.byIcon(Icons.handshake), findsOneWidget);
   });
 
   testWidgets('manual refresh replaces the static snapshot', (tester) async {

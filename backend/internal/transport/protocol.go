@@ -76,6 +76,11 @@ type SequenceCount struct {
 
 // State is a per-viewer snapshot. Hand contains only the requesting player's
 // cards; spectators receive an empty hand and a nil viewer.
+//
+// Status is "waiting", "playing", or "finished". Winner is nil while playing
+// and on a draw: a finished state with a null winner is a draw (deck
+// exhausted with no legal move), while a finished state with a winner is a
+// win. Clients must distinguish the two by the winner, not by the status.
 type State struct {
 	MatchID        string          `json:"match_id"`
 	Status         string          `json:"status"`
@@ -182,7 +187,9 @@ type moveResultPayload struct {
 	Duplicate bool   `json:"duplicate"`
 	Status    string `json:"status"`
 	Turn      int    `json:"turn"`
-	Winner    *int   `json:"winner"`
+	// Winner is nil unless this move won the match. A drawing move reports
+	// Status "finished" with a nil winner.
+	Winner *int `json:"winner"`
 }
 
 type errorPayload struct {

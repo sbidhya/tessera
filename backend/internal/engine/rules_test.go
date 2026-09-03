@@ -360,7 +360,9 @@ func TestPlaceRecordsSequenceWithoutWinning(t *testing.T) {
 	gs.place(0, Cell{5, 1}, Cell{5, 2}, Cell{5, 3}, Cell{5, 4})
 	winCard, _ := gs.Board.CardAt(Cell{5, 5})
 	gs.Hands[0] = []Card{winCard}
-	gs.Draw = []Card{{Queen, Clubs}}
+	// Two cards remain so the pile is still non-empty after the replacement
+	// draw; a mid-game position must not read as deck exhaustion (a draw).
+	gs.Draw = []Card{{King, Hearts}, {Queen, Clubs}}
 
 	if err := gs.Apply(Move{Player: 0, Type: MovePlace, Card: winCard, Cell: Cell{5, 5}}); err != nil {
 		t.Fatalf("Apply: %v", err)

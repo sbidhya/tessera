@@ -319,8 +319,10 @@ class MatchState {
     if (viewer == null && hand.isNotEmpty) {
       throw const FormatException('spectator state exposes a hand');
     }
-    if (winner != null && status != 'finished' ||
-        winner == null && status == 'finished') {
+    // A winner implies a finished match, but a finished match may carry a
+    // null winner: that is a draw (deck exhausted with no legal move left),
+    // not a corrupt snapshot.
+    if (winner != null && status != 'finished') {
       throw const FormatException('winner does not match status');
     }
 
@@ -342,6 +344,10 @@ class MatchState {
       players: List.unmodifiable(players),
     );
   }
+
+  /// `true` when the match ended with no winner: the deck ran out with no
+  /// legal move left. A finished match with a winner is a win.
+  bool get isDraw => status == 'finished' && winner == null;
 
   Map<BoardPosition, BoardChipState> get chipsByPosition => {
     for (final chip in chips) chip.position: chip,

@@ -71,3 +71,10 @@ sequences at once; `TestDetectTwoSequencesAtOnce` covers that.
 - 2 players; `SequencesToWin` configurable (default 2, use 1 for fast games).
 - Empty draw pile is a rare late-game edge case: a play still succeeds but no
   replacement is drawn (the hand shrinks).
+- Deck exhaustion ends the match in a **draw**: when the pile is empty and the
+  player to move has no legal move, the game is marked `Drawn` — an explicit
+  terminal marker kept separate from `Winner == NoPlayer` ("in progress").
+  `GameOver` is true for wins and draws alike. The trigger checks the player
+  to move (not just empty hands) so stuck positions — e.g. only one-eyed
+  jacks with nothing removable — also terminate instead of stranding the
+  match. A winning move always takes precedence over a draw.

@@ -70,8 +70,26 @@ type GameState struct {
 	SequencesWon map[PlayerID]int
 	Sequences    []Sequence
 
-	// Winner is the winning player, or NoPlayer while the game is in progress.
+	// Winner is the winning player, or NoPlayer while the game is in progress
+	// or when the game ends in a draw (see Drawn).
 	Winner PlayerID
+
+	// Drawn marks a terminal drawn match: the draw pile is exhausted and the
+	// player to move has no legal move. It is the explicit "over with no
+	// winner" marker, kept separate from Winner == NoPlayer (which on its own
+	// still means "in progress"). GameOver is true when either is set.
+	//
+	// Draw trigger (documented choice): deck empty AND the player to move has
+	// no legal move. The simpler alternative — deck empty and all hands empty
+	// — is subsumed by this rule (an empty hand has no legal move) but misses
+	// stuck positions where hands are non-empty yet unplayable, e.g. a hand of
+	// only one-eyed jacks with no removable opponent chip. Checking the player
+	// to move guarantees no legal continuation exists from the terminal state,
+	// which is what lets the room layer safely archive and evict the match.
+	// The deck-empty gate preserves the standard Sequence rule that a draw is
+	// declared when the deck runs out, and avoids ending matches while
+	// replacements remain.
+	Drawn bool
 
 	// deadCardUsed tracks the once-per-turn dead-card swap allowance.
 	deadCardUsed bool
@@ -113,28 +131,38 @@ func NewGame(rng *rand.Rand, opts Options) (*GameState, error) {
 	// real shuffled deck).
 	for i := 0; i < hs; i++ {
 		for p := 0; p < opts.NumPlayers; p++ {
-			card := gs.drawCard()
-			gs.Hands[PlayerID(p)] = append(gs.Hands[PlayerID(p)], card)
+			if card, ok := gs.drawCard(); ok {
+				gs.Hands[PlayerID(p)] = append(gs.Hands[PlayerID(p)], card)
+			}
 		}
 	}
 
 	return gs, nil
 }
 
-// GameOver reports whether the game has a winner.
-func (gs *GameState) GameOver() bool { return gs.Winner != NoPlayer }
+// GameOver reports whether the game has reached a terminal state: a win
+// (Winner set) or a draw (Drawn set).
+func (gs *GameState) GameOver() bool { return gs.Winner != NoPlayer || gs.Drawn }
 
-// drawCard pops the top card off the draw pile. It returns the zero Card if the
-// pile is empty; callers treat an empty pile as "no replacement drawn" (hands
+// IsDraw reports whether the game ended in a draw: no winner, deck exhausted,
+// and no legal move for the player to move.
+func (gs *GameState) IsDraw() bool { return gs.Drawn && gs.Winner == NoPlayer }
+
+// drawCard pops the top card off the draw pile, reporting false when the pile
+// is empty. Callers treat an empty pile as "no replacement drawn" (hands
 // simply shrink), which is a rare late-game edge case.
-func (gs *GameState) drawCard() Card {
+//
+// The boolean (rather than a zero-Card sentinel) matters because Card{} is a
+// real card — Ace of Spades — so comparing against it would silently drop a
+// legitimately drawn A♠.
+func (gs *GameState) drawCard() (Card, bool) {
 	n := len(gs.Draw)
 	if n == 0 {
-		return Card{}
+		return Card{}, false
 	}
 	card := gs.Draw[n-1]
 	gs.Draw = gs.Draw[:n-1]
-	return card
+	return card, true
 }
 
 // handIndex returns the index of card in player p's hand, or -1 if absent.
