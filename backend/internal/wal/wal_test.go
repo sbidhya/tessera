@@ -317,12 +317,13 @@ func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
 	if err := store.Checkpoint("r_done", 4); err != nil {
 		t.Fatalf("idempotent Checkpoint: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "r_done.wal"))
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
+	// A successful checkpoint closes the fd, drops the in-memory entry, and
+	// unlinks the file so a long-lived process does not leak one fd per match.
+	if got := len(store.files); got != 0 {
+		t.Errorf("open files after checkpoint = %d, want 0", got)
 	}
-	if info.Size() != 0 {
-		t.Errorf("checkpointed WAL size = %d, want 0", info.Size())
+	if _, err := os.Stat(filepath.Join(dir, "r_done.wal")); !os.IsNotExist(err) {
+		t.Errorf("stat checkpointed WAL = %v, want not-exist", err)
 	}
 	if err := store.Append(testEvent("r_done", 5, "bob")); !errors.Is(err, ErrCheckpointed) {
 		t.Errorf("Append after checkpoint = %v, want ErrCheckpointed", err)
@@ -344,6 +345,82 @@ func TestCheckpointTruncatesOnlyTerminalWAL(t *testing.T) {
 		t.Errorf("checkpointed events = %+v, want none", events)
 	}
 	if err := reopened.Checkpoint("r_done", 4); err != nil {
-		t.Fatalf("checkpoint zero-length WAL after restart: %v", err)
+		t.Fatalf("checkpoint missing WAL after restart: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "r_done.wal")); !os.IsNotExist(err) {
+		t.Errorf("stat WAL after repeat checkpoint = %v, want not-exist (must not resurrect)", err)
+	}
+}
+
+func TestCheckpointReleasesFDAndRemovesFile(t *testing.T) {
+	for _, policy := range []SyncPolicy{SyncAlways, SyncNever} {
+		t.Run(string(policy), func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := Open(dir, policy)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			for _, id := range []string{"r_a", "r_b", "r_c"} {
+				for seq := uint64(1); seq <= 2; seq++ {
+					if err := store.Append(testEvent(id, seq, "alice")); err != nil {
+						t.Fatalf("Append %s/%d: %v", id, seq, err)
+					}
+				}
+			}
+			if got := len(store.files); got != 3 {
+				t.Fatalf("open files before checkpoint = %d, want 3", got)
+			}
+			for _, id := range []string{"r_a", "r_b", "r_c"} {
+				if err := store.Checkpoint(id, 2); err != nil {
+					t.Fatalf("Checkpoint %s: %v", id, err)
+				}
+			}
+			if got := len(store.files); got != 0 {
+				t.Errorf("open files after checkpoint = %d, want 0", got)
+			}
+			for _, id := range []string{"r_a", "r_b", "r_c"} {
+				if _, err := os.Stat(filepath.Join(dir, id+".wal")); !os.IsNotExist(err) {
+					t.Errorf("stat %s WAL = %v, want not-exist", id, err)
+				}
+				// A repeat checkpoint is a no-op success and must not
+				// recreate the file through O_CREATE.
+				if err := store.Checkpoint(id, 2); err != nil {
+					t.Errorf("double Checkpoint %s: %v", id, err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, id+".wal")); !os.IsNotExist(err) {
+					t.Errorf("stat %s WAL after double checkpoint = %v, want not-exist", id, err)
+				}
+				if err := store.Append(testEvent(id, 3, "bob")); !errors.Is(err, ErrCheckpointed) {
+					t.Errorf("Append %s after checkpoint = %v, want ErrCheckpointed", id, err)
+				}
+			}
+			// Close must succeed after every fd was already closed and removed.
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close after checkpoints: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("second Close: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckpointMissingFileSucceedsWithoutCreating(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, SyncAlways)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	// Checkpointing a room that never had a WAL must succeed and must not
+	// create an empty file on disk.
+	if err := store.Checkpoint("r_ghost", 7); err != nil {
+		t.Fatalf("Checkpoint missing file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "r_ghost.wal")); !os.IsNotExist(err) {
+		t.Fatalf("stat ghost WAL = %v, want not-exist", err)
+	}
+	if err := store.Checkpoint("r_ghost", 7); err != nil {
+		t.Fatalf("double Checkpoint missing file: %v", err)
 	}
 }

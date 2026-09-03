@@ -63,9 +63,10 @@ type Store struct {
 	dir    string
 	policy SyncPolicy
 
-	mu     sync.Mutex
-	files  map[string]*logFile
-	closed bool
+	mu           sync.Mutex
+	files        map[string]*logFile
+	checkpointed map[string]struct{}
+	closed       bool
 }
 
 type logFile struct {
@@ -87,7 +88,7 @@ func Open(dir string, policy SyncPolicy) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("wal: create directory %s: %w", dir, err)
 	}
-	return &Store{dir: dir, policy: policy, files: make(map[string]*logFile)}, nil
+	return &Store{dir: dir, policy: policy, files: make(map[string]*logFile), checkpointed: make(map[string]struct{})}, nil
 }
 
 // Append writes one checksummed frame and, under SyncAlways, fsyncs it before
@@ -115,6 +116,10 @@ func (s *Store) Append(event room.Event) error {
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
+	}
+	if _, ok := s.checkpointed[event.RoomID]; ok {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrCheckpointed, event.RoomID)
 	}
 	log, err := s.fileLocked(event.RoomID)
 	s.mu.Unlock()
@@ -180,14 +185,36 @@ func (s *Store) fileLocked(roomID string) (*logFile, error) {
 	return log, nil
 }
 
-// Checkpoint truncates a finished match's WAL only after its SQLite archive has
+func (s *Store) fsyncDir() error {
+	dir, err := os.Open(s.dir)
+	if err != nil {
+		return fmt.Errorf("wal: open directory for sync: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("wal: sync directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("wal: close directory after sync: %w", closeErr)
+	}
+	return nil
+}
+
+// Checkpoint removes a finished match's WAL only after its SQLite archive has
 // committed. throughSeq must be the terminal (and therefore final) event in the
 // file; refusing a suffix prevents accidentally discarding an event that the
 // cold tier has not stored.
 //
-// A zero-length file is an idempotent success. That is important when a process
+// Checkpointing closes the match's file descriptor, removes the in-memory
+// entry, and unlinks the .wal file. Under SyncAlways the directory is fsynced
+// after the unlink so the removal itself is durable, mirroring the create
+// path's directory fsync.
+//
+// A missing file is an idempotent success. That is important when a process
 // commits SQLite and checkpoints the WAL, then dies before its in-memory queue
-// records completion: recovery may safely ask to checkpoint the same match.
+// records completion: recovery may safely ask to checkpoint the same match,
+// and a checkpointed file stays gone rather than being recreated.
 func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
 	if !validRoomID(roomID) {
 		return fmt.Errorf("wal: unsafe room id %q", roomID)
@@ -196,16 +223,64 @@ func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
 		return errors.New("wal: checkpoint sequence must not be zero")
 	}
 
+	path := filepath.Join(s.dir, roomID+".wal")
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
 	}
-	log, err := s.fileLocked(roomID)
-	s.mu.Unlock()
-	if err != nil {
-		return err
+	if _, ok := s.checkpointed[roomID]; ok {
+		s.mu.Unlock()
+		return nil
 	}
+	log := s.files[roomID]
+	if log == nil {
+		// No open descriptor. Stat without creating so a checkpoint after a
+		// successful unlink (or for a room that never existed) does not
+		// resurrect an empty file via fileLocked's O_CREATE.
+		if _, statErr := os.Stat(path); statErr != nil {
+			if os.IsNotExist(statErr) {
+				s.checkpointed[roomID] = struct{}{}
+				s.mu.Unlock()
+				if s.policy == SyncAlways {
+					if err := s.fsyncDir(); err != nil {
+						s.mu.Lock()
+						delete(s.checkpointed, roomID)
+						s.mu.Unlock()
+						return err
+					}
+				}
+				return nil
+			}
+			s.mu.Unlock()
+			return fmt.Errorf("wal: stat room %s: %w", roomID, statErr)
+		}
+		// The file exists on disk but has no open descriptor (for example
+		// after a restart). Open it without O_CREATE and track it so this
+		// checkpoint serializes with concurrent appends on log.mu.
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			if os.IsNotExist(err) {
+				s.checkpointed[roomID] = struct{}{}
+				s.mu.Unlock()
+				if s.policy == SyncAlways {
+					if syncErr := s.fsyncDir(); syncErr != nil {
+						s.mu.Lock()
+						delete(s.checkpointed, roomID)
+						s.mu.Unlock()
+						return syncErr
+					}
+				}
+				return nil
+			}
+			s.mu.Unlock()
+			return fmt.Errorf("wal: open room %s: %w", roomID, err)
+		}
+		log = &logFile{file: f}
+		s.files[roomID] = log
+	}
+	s.mu.Unlock()
 
 	log.mu.Lock()
 	defer log.mu.Unlock()
@@ -219,27 +294,95 @@ func (s *Store) Checkpoint(roomID string, throughSeq uint64) error {
 		return fmt.Errorf("wal: room %s unavailable after prior failure: %w", roomID, log.failed)
 	}
 
-	path := filepath.Join(s.dir, roomID+".wal")
 	events, err := s.readFile(path, roomID)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return s.checkpointGoneLocked(roomID, log)
+		}
 		return err
 	}
-	if len(events) == 0 {
-		log.checkpointed = true
-		return nil
-	}
-	last := events[len(events)-1].Seq
-	if last != throughSeq {
-		return fmt.Errorf("wal: checkpoint room %s through %d, final event is %d", roomID, throughSeq, last)
+	if len(events) != 0 {
+		last := events[len(events)-1].Seq
+		if last != throughSeq {
+			return fmt.Errorf("wal: checkpoint room %s through %d, final event is %d", roomID, throughSeq, last)
+		}
 	}
 
-	if err := log.file.Truncate(0); err != nil {
-		log.failed = fmt.Errorf("wal: truncate checkpoint for room %s: %w", roomID, err)
-		return log.failed
+	if log.file != nil {
+		closeErr := log.file.Close()
+		log.file = nil
+		if closeErr != nil {
+			log.failed = fmt.Errorf("wal: close checkpoint for room %s: %w", roomID, closeErr)
+			return log.failed
+		}
 	}
-	if err := log.file.Sync(); err != nil {
-		log.failed = fmt.Errorf("wal: sync checkpoint for room %s: %w", roomID, err)
-		return log.failed
+
+	// Block new appends before the unlink so a concurrent Append cannot
+	// recreate the file between the map delete and the remove.
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	s.checkpointed[roomID] = struct{}{}
+	if s.files[roomID] == log {
+		delete(s.files, roomID)
+	}
+	s.mu.Unlock()
+
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			s.mu.Lock()
+			delete(s.checkpointed, roomID)
+			s.mu.Unlock()
+			log.failed = fmt.Errorf("wal: remove checkpoint for room %s: %w", roomID, err)
+			return log.failed
+		}
+	}
+	if s.policy == SyncAlways {
+		if err := s.fsyncDir(); err != nil {
+			s.mu.Lock()
+			delete(s.checkpointed, roomID)
+			s.mu.Unlock()
+			log.failed = fmt.Errorf("wal: sync checkpoint remove for room %s: %w", roomID, err)
+			return log.failed
+		}
+	}
+	log.checkpointed = true
+	return nil
+}
+
+// checkpointGoneLocked completes a checkpoint whose .wal file is already gone
+// from disk. The caller holds log.mu. The open descriptor is closed, the
+// in-memory entry is removed, and the checkpoint is recorded so later appends
+// fail and later checkpoints succeed without recreating the file.
+func (s *Store) checkpointGoneLocked(roomID string, log *logFile) error {
+	if log.file != nil {
+		closeErr := log.file.Close()
+		log.file = nil
+		if closeErr != nil {
+			log.failed = fmt.Errorf("wal: close checkpoint for room %s: %w", roomID, closeErr)
+			return log.failed
+		}
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	s.checkpointed[roomID] = struct{}{}
+	if s.files[roomID] == log {
+		delete(s.files, roomID)
+	}
+	s.mu.Unlock()
+	if s.policy == SyncAlways {
+		if err := s.fsyncDir(); err != nil {
+			s.mu.Lock()
+			delete(s.checkpointed, roomID)
+			s.mu.Unlock()
+			log.failed = fmt.Errorf("wal: sync checkpoint remove for room %s: %w", roomID, err)
+			return log.failed
+		}
 	}
 	log.checkpointed = true
 	return nil
@@ -349,7 +492,9 @@ func (s *Store) repairTail(f *os.File, validBytes int64) error {
 	return nil
 }
 
-// Close releases all open files. It is idempotent.
+// Close releases all open files. It is idempotent. Entries already closed and
+// removed by Checkpoint are not present, and any nil descriptor left behind is
+// skipped so Close stays safe after checkpoint cleanup.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -365,8 +510,11 @@ func (s *Store) Close() error {
 	for roomID, log := range files {
 		log.mu.Lock()
 		log.closed = true
-		if err := log.file.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("wal: close room %s: %w", roomID, err))
+		if log.file != nil {
+			if err := log.file.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("wal: close room %s: %w", roomID, err))
+			}
+			log.file = nil
 		}
 		log.mu.Unlock()
 	}
